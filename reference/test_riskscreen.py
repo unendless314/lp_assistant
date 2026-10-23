@@ -1,0 +1,1126 @@
+"""Unit tests for the pure-math / pure-logic parts of riskscreen.py.
+
+Deliberately excludes anything that hits the network or `baw` -- those are
+covered by manual CLI smoke tests (see README "Status"). Run with:
+    pytest test_riskscreen.py -v
+"""
+
+import argparse
+import json
+import math
+import random
+
+import pytest
+
+from bstocks_lp.cli import (
+    SWITCH_PAYBACK_DAYS_WORTHWHILE,
+    _apy_fraction,
+    _best_alternative_for_ticker,
+    _nonneg_float,
+    _offset_fraction,
+    _peer_apys_for_ticker,
+    _positive_band_width,
+    _positive_int,
+    _switching_recommendation,
+    _v4_override_reason,
+)
+from bstocks_lp.config import (
+    SCHEMA_VERSION,
+    _json_envelope,
+    _load_stablecoin_addresses,
+    is_stablecoin,
+)
+from bstocks_lp.il_model import (
+    _il_at_price_ratio,
+    breakeven_volatility,
+    expected_il_fraction,
+    richness_grade,
+    risk_adjusted_apy,
+    vol_richness_ratio,
+)
+from bstocks_lp.market_data import (
+    resolve_pool_apy,
+    resolve_pool_stock_and_quote,
+    resolve_pool_tvl,
+)
+from bstocks_lp.range_model import (
+    _exact_double_barrier_no_exit_probability,
+    _single_barrier_touch_probability,
+    _union_bound_no_exit_probability,
+    concentration_multiplier,
+    confidence_grade,
+    no_exit_probability,
+    range_metrics,
+    recommend_range,
+)
+from bstocks_lp.risk_screen import evaluate_pool, pool_risk_flags
+from bstocks_lp.scan import (
+    VERDICT_ENTER,
+    VERDICT_WATCH,
+    _classify_fetch_error,
+    _summarize_unscoreable,
+    classify_verdict,
+    passes_trade_gate,
+)
+from bstocks_lp.volatility import (
+    _rogers_satchell_variance,
+    annualized_volatility,
+    best_available_volatility,
+    relative_annualized_volatility,
+    yang_zhang_volatility,
+)
+
+
+def make_klines(closes):
+    """Build minimal kline rows (only the close field, index 4, is read)."""
+    return [[i, "0", "0", "0", str(c), "0", i] for i, c in enumerate(closes)]
+
+
+def make_ohlc_klines(rows):
+    """rows: list of (open, high, low, close) tuples -> full kline rows."""
+    return [[i, str(o), str(h), str(lo), str(c), "0", i] for i, (o, h, lo, c) in enumerate(rows)]
+
+
+# ---- annualized_volatility ----
+
+def test_annualized_volatility_needs_at_least_3_closes():
+    assert annualized_volatility(make_klines([100, 101])) is None
+
+
+def test_annualized_volatility_zero_for_constant_price():
+    assert annualized_volatility(make_klines([100] * 10)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_annualized_volatility_positive_for_varying_price():
+    closes = [100, 105, 98, 110, 95, 103, 99, 108, 101, 97]
+    sigma = annualized_volatility(make_klines(closes))
+    assert sigma > 0
+
+
+def test_annualized_volatility_ignores_non_positive_closes():
+    # a zero/negative close (bad data) must not crash the log-return calc
+    closes = [100, 0, 105, 102]
+    sigma = annualized_volatility(make_klines(closes))
+    assert sigma is not None and sigma >= 0
+
+
+# ---- expected_il_fraction / breakeven_volatility / vol_richness_ratio ----
+
+def test_expected_il_fraction_scales_with_variance():
+    assert expected_il_fraction(0.4) == pytest.approx(0.4 ** 2 / 8)
+    assert expected_il_fraction(0.0) == 0.0
+
+
+def test_expected_il_fraction_none_for_extreme_volatility():
+    # Real bug this locks in, round two. The raw diffusion formula sigma^2/8 is only a
+    # small-sigma Taylor approximation and silently exceeds 1.0 past sigma = sqrt(8) ~= 283%
+    # annualized -- confirmed live on a real pool (a stock this volatile in practice, sigma
+    # ~310%) whose uncapped "expected IL" came out to ~120%, which is impossible under this
+    # model's own IL definition (true IL asymptotically approaches but never reaches 100%, even
+    # at pa->0, pb->infinity -- see _il_at_price_ratio). A first fix clamped the result to 1.0 --
+    # rejected on review: past this threshold the formula hasn't just hit a ceiling, it has left
+    # the regime it was ever valid for, so *any* single number (1.0 included) is false precision.
+    # Returns None instead, so callers can say "N/A" rather than present a guess as an estimate.
+    assert expected_il_fraction(3.10) is None
+    assert expected_il_fraction(5.0) is None
+    # just under the sqrt(8) ~= 2.828 threshold, the formula is still below 1.0 and unaffected
+    assert expected_il_fraction(2.8) == pytest.approx(2.8 ** 2 / 8)
+
+
+def test_risk_adjusted_apy_propagates_none_but_keeps_vol_ratio():
+    scored = risk_adjusted_apy(apy=3.70, sigma_annual=3.10)
+    assert scored["expected_il"] is None
+    assert scored["model_net_apy"] is None
+    # vol_ratio is a function of sigma/apy alone, not of the (unavailable) IL estimate
+    assert scored["vol_ratio"] is not None
+    assert expected_il_fraction(2.8) < 1.0
+
+
+def test_breakeven_volatility_inverts_expected_il():
+    apy = 0.30
+    sigma_star = breakeven_volatility(apy)
+    # by construction, plugging sigma* back into expected_il_fraction returns apy
+    assert expected_il_fraction(sigma_star) == pytest.approx(apy)
+
+
+def test_breakeven_volatility_zero_for_non_positive_apy():
+    assert breakeven_volatility(0) == 0.0
+    assert breakeven_volatility(-0.1) == 0.0
+
+
+def test_vol_richness_ratio_below_one_is_rich():
+    # realized vol well under breakeven -> pool pays more than the risk implies
+    ratio = vol_richness_ratio(sigma_realized=0.20, apy=1.0)
+    assert ratio < 1.0
+
+
+def test_vol_richness_ratio_above_one_is_cheap():
+    ratio = vol_richness_ratio(sigma_realized=2.0, apy=0.05)
+    assert ratio > 1.0
+
+
+def test_vol_richness_ratio_infinite_at_zero_apy_with_real_vol():
+    ratio = vol_richness_ratio(sigma_realized=0.3, apy=0)
+    assert ratio == float("inf")
+
+
+def test_vol_richness_ratio_none_when_both_zero():
+    assert vol_richness_ratio(sigma_realized=0.0, apy=0) is None
+
+
+# ---- richness_grade / confidence_grade ----
+
+@pytest.mark.parametrize("ratio,expected", [
+    (0.1, "Rich"),
+    (0.49, "Rich"),
+    (0.5, "Fair"),
+    (0.99, "Fair"),
+    (1.0, "Cheap"),
+    (5.0, "Cheap"),
+    (float("inf"), "Cheap"),
+    (None, "n/a"),
+])
+def test_richness_grade_bands(ratio, expected):
+    assert richness_grade(ratio) == expected
+
+
+@pytest.mark.parametrize("p,expected", [
+    (0.9, "High"),
+    (0.8, "High"),
+    (0.79, "Moderate"),
+    (0.6, "Moderate"),
+    (0.59, "Low"),
+    (0.0, "Low"),
+    (None, "n/a"),
+])
+def test_confidence_grade_bands(p, expected):
+    assert confidence_grade(p) == expected
+
+
+# ---- concentration_multiplier ----
+
+def test_concentration_multiplier_full_range_is_one():
+    # a very wide range approximates the unconcentrated (full-range) case
+    m = concentration_multiplier(1e-6, 1e6)
+    assert m == pytest.approx(1.0, abs=1e-3)
+
+
+def test_concentration_multiplier_increases_as_range_narrows():
+    wide = concentration_multiplier(0.5, 1.5)
+    narrow = concentration_multiplier(0.9, 1.1)
+    assert narrow > wide > 1.0
+
+
+# ---- barrier / no-exit probability ----
+
+def test_single_barrier_touch_probability_zero_vol_never_touches_away_barrier():
+    assert _single_barrier_touch_probability(2.0, sigma_annual=0.0) == 0.0
+
+
+def test_single_barrier_touch_probability_at_the_money_is_certain():
+    # a barrier exactly at the current price (ratio=1) is already touched
+    assert _single_barrier_touch_probability(1.0, sigma_annual=0.4) == pytest.approx(1.0)
+
+
+def test_single_barrier_touch_probability_higher_vol_touches_more_often():
+    low = _single_barrier_touch_probability(1.5, sigma_annual=0.2)
+    high = _single_barrier_touch_probability(1.5, sigma_annual=0.8)
+    assert high > low
+
+
+def test_no_exit_probability_narrower_range_is_less_safe():
+    wide = no_exit_probability(0.5, 1.5, sigma_annual=0.4)
+    narrow = no_exit_probability(0.9, 1.1, sigma_annual=0.4)
+    assert 0.0 <= narrow < wide <= 1.0
+
+
+def test_no_exit_probability_never_negative():
+    # a very narrow range at high vol should be ~0 (not literally negative) -- the exact
+    # reflection-series formula correctly returns a tiny positive number here rather than
+    # clamping to exactly 0 like the old union-bound approximation did
+    result = no_exit_probability(0.99, 1.01, sigma_annual=2.0)
+    assert 0.0 <= result < 0.001
+
+
+# ---- range_metrics ----
+
+def test_range_metrics_rejects_invalid_bounds():
+    with pytest.raises(ValueError):
+        range_metrics(0.3, 0.4, pa=1.2, pb=0.8)  # pb <= pa
+    with pytest.raises(ValueError):
+        range_metrics(0.3, 0.4, pa=0, pb=1.5)  # pa <= 0
+
+
+def test_range_metrics_straddle_mode():
+    m = range_metrics(pool_apy=0.5, sigma_annual=0.4, pa=0.8, pb=1.2)
+    assert m["mode"] == "market_making"
+    assert 0.0 <= m["p_active"] <= 1.0
+
+
+def test_range_metrics_sell_limit_mode_above_price():
+    m = range_metrics(pool_apy=0.5, sigma_annual=0.4, pa=1.1, pb=1.3)
+    assert m["mode"] == "sell_limit"
+
+
+def test_range_metrics_buy_limit_mode_below_price():
+    m = range_metrics(pool_apy=0.5, sigma_annual=0.4, pa=0.7, pb=0.9)
+    assert m["mode"] == "buy_limit"
+
+
+def test_range_metrics_narrower_range_has_higher_concentration():
+    wide = range_metrics(0.5, 0.4, pa=0.5, pb=1.5)
+    narrow = range_metrics(0.5, 0.4, pa=0.9, pb=1.1)
+    assert narrow["concentration"] > wide["concentration"]
+
+
+def test_il_at_price_ratio_zero_at_no_move():
+    assert _il_at_price_ratio(1.0) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_il_at_price_ratio_positive_away_from_one():
+    assert _il_at_price_ratio(2.0) > 0
+    assert _il_at_price_ratio(0.5) > 0
+
+
+# ---- recommend_range ----
+
+def test_recommend_range_straddle_includes_full_range_row():
+    rows, best = recommend_range(pool_apy=0.5, sigma_annual=0.4, side="straddle")
+    assert any(r["pb"] is None for r in rows)  # the synthetic full-range row
+    assert best in rows
+
+
+def test_recommend_range_sell_side_rows_are_all_above_price():
+    rows, best = recommend_range(pool_apy=0.5, sigma_annual=0.4, side="sell")
+    assert all(r["pa"] >= 1.0 for r in rows)
+
+
+def test_recommend_range_buy_side_rows_are_all_below_price():
+    rows, best = recommend_range(pool_apy=0.5, sigma_annual=0.4, side="buy")
+    assert all(r["pb"] <= 1.0 for r in rows)
+
+
+def test_recommend_range_rejects_unknown_side():
+    with pytest.raises(ValueError):
+        recommend_range(0.5, 0.4, side="sideways")
+
+
+def test_recommend_range_falls_back_when_nothing_meets_safety_floor():
+    # extremely high vol -> every candidate likely fails the confidence floor;
+    # recommend_range must still return *some* best row, not crash/return None
+    rows, best = recommend_range(pool_apy=0.1, sigma_annual=5.0, side="straddle")
+    assert best is not None
+    assert best in rows
+
+
+def test_recommend_range_never_recommends_the_unscoreable_full_range_row():
+    # Real issue this locks in: at sigma this high (> sqrt(8) ~= 283% annualized), the synthetic
+    # full-range row's model_net_apy is None (see expected_il_fraction) -- max() can't rank None
+    # against a number, and even if it could, "recommend the one we can't quantify" is wrong.
+    # The concentrated rows always fall back to the exact boundary IL (range_metrics), which
+    # stays valid at any volatility, so a real recommendation is always available.
+    rows, best = recommend_range(pool_apy=3.70, sigma_annual=3.10, side="straddle")
+    full_range_row = next(r for r in rows if r["pb"] is None)
+    assert full_range_row["model_net_apy"] is None  # still present in rows, just unscoreable
+    assert best["model_net_apy"] is not None
+    assert best is not full_range_row
+
+
+# ---- pool_risk_flags ----
+
+def test_pool_risk_flags_clean_pool_has_no_flags():
+    pool = {"tvl": "50000"}
+    info = {"feeRate": "0.003", "tvl": "50000", "apy": "0.5", "investable": True}
+    assert pool_risk_flags(pool, info, 0.5) == []
+
+
+def test_pool_risk_flags_catches_extreme_fee_rate():
+    pool = {"tvl": "271479"}
+    info = {"feeRate": "8.38861", "tvl": "271479", "apyBps": "165877"}
+    flags = pool_risk_flags(pool, info, 16.5877)
+    assert any("feeRate" in f for f in flags)
+
+
+def test_pool_risk_flags_catches_low_tvl():
+    pool = {"tvl": "100"}
+    info = {"feeRate": "0.003", "tvl": "100", "apy": "0.2"}
+    flags = pool_risk_flags(pool, info, 0.2)
+    assert any("TVL" in f for f in flags)
+
+
+def test_pool_risk_flags_catches_delisted_product():
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "0.2", "investable": False}
+    flags = pool_risk_flags(pool, info, 0.2)
+    assert any("delisted" in f for f in flags)
+
+
+def test_pool_risk_flags_catches_low_protocol_security_score():
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "0.2"}
+    flags = pool_risk_flags(pool, info, 0.2, protocol_security_score=30)
+    assert any("security score" in f for f in flags)
+
+
+def test_pool_risk_flags_catches_peer_outlier():
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "1.0"}  # 100% apy
+    peers = [0.10, 0.12, 0.11]  # peer median 11%, this pool is ~9x that
+    flags = pool_risk_flags(pool, info, 1.0, peer_apys=peers)
+    assert any("outlier" in f for f in flags)
+
+
+def test_pool_risk_flags_skips_peer_outlier_below_min_sample_size():
+    # a "median" from one or two peers isn't a reliable benchmark -- confirmed live: a
+    # GMEB-USDT pool was flagged as "6.0x the median" against its single peer, and that
+    # peer's own apy had moved 84.7% -> 123.20% within the same session, while the flagged
+    # pool's feeRate/TVL/incentive data showed no actual defect (see risk_screen.py).
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "1.0"}
+    assert pool_risk_flags(pool, info, 1.0, peer_apys=[0.10]) == []
+    assert pool_risk_flags(pool, info, 1.0, peer_apys=[0.10, 0.12]) == []
+    # but three-or-more peers is enough for the check to apply again
+    flags = pool_risk_flags(pool, info, 1.0, peer_apys=[0.10, 0.12, 0.11])
+    assert any("outlier" in f for f in flags)
+
+
+def test_pool_risk_flags_does_not_flag_within_peer_range():
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "0.15"}
+    peers = [0.10, 0.12, 0.18]
+    assert pool_risk_flags(pool, info, 0.15, peer_apys=peers) == []
+
+
+def test_pool_risk_flags_peer_check_excludes_self_by_construction():
+    # regression test: peer_apys must be pre-excluded by the caller (identity,
+    # not value) -- pool_risk_flags must not re-filter by apy value, so a
+    # peer list that happens to still include this pool's own apy is used
+    # as-is (this documents the contract, not a bug in pool_risk_flags itself)
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "0.5"}
+    peers_including_self = [0.5, 0.5, 0.5]
+    flags = pool_risk_flags(pool, info, 0.5, peer_apys=peers_including_self)
+    assert flags == []  # median == apy, not an outlier either way
+
+
+def test_pool_risk_flags_uses_the_passed_apy_not_a_recompute_from_info_alone():
+    # Confirmed live: pool_risk_flags used to re-derive apy from `info` alone (a narrower
+    # 2-tier fallback than resolve_pool_apy's 3-tier chain), so a pool whose `info` carried
+    # neither `apy` nor `apyBps` silently scored apy=0.0 internally here -- the peer-outlier
+    # check could never fire for such a pool no matter how far outside the peer range its real
+    # (pool-level) apy actually was. `info` below deliberately has neither field; the real apy
+    # (an outlier vs. peers) is only knowable from `pool`, exactly resolve_pool_apy's 3rd tier.
+    pool = {"tvl": "50000", "apy": "1.0"}
+    info = {"tvl": "50000"}  # no apy, no apyBps
+    peers = [0.10, 0.12, 0.11]  # median 11%; the real apy (1.0) is ~9x that
+    apy = resolve_pool_apy(pool, info)
+    flags = pool_risk_flags(pool, info, apy, peer_apys=peers)
+    assert any("outlier" in f for f in flags)
+
+
+# ---- is_stablecoin ----
+
+def test_is_stablecoin_matches_known_bsc_usdt():
+    assert is_stablecoin("56", "0x55d398326f99059fF775485246999027B3197955")  # mixed-case input
+    assert is_stablecoin("56", "0x55d398326f99059ff775485246999027b3197955")  # lowercase
+
+
+def test_is_stablecoin_false_for_bnb():
+    assert not is_stablecoin("56", "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE")
+
+
+def test_is_stablecoin_false_for_unknown_chain():
+    assert not is_stablecoin("999", "0x55d398326f99059ff775485246999027b3197955")
+
+
+# ---- _load_stablecoin_addresses (config-file, not hardcoded-in-code) ----
+
+def test_load_stablecoin_addresses_reads_and_lowercases_config(tmp_path):
+    config = tmp_path / "stablecoins.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "stablecoins": [{"chainId": "56", "address": "0xABCDEF", "symbol": "FAKE"}],
+    }))
+    addresses = _load_stablecoin_addresses(str(config))
+    assert addresses == {("56", "0xabcdef")}
+
+
+def test_load_stablecoin_addresses_fails_closed_on_missing_file(tmp_path, capsys):
+    missing = tmp_path / "does_not_exist.json"
+    addresses = _load_stablecoin_addresses(str(missing))
+    assert addresses == set()  # empty, not a crash -- and not a stale in-code fallback
+    assert "warning" in capsys.readouterr().err.lower()
+
+
+def test_load_stablecoin_addresses_fails_closed_on_malformed_json(tmp_path, capsys):
+    config = tmp_path / "stablecoins.json"
+    config.write_text("{not valid json")
+    addresses = _load_stablecoin_addresses(str(config))
+    assert addresses == set()
+    assert "warning" in capsys.readouterr().err.lower()
+
+
+def test_load_stablecoin_addresses_fails_closed_on_missing_stablecoins_key(tmp_path, capsys):
+    config = tmp_path / "stablecoins.json"
+    config.write_text(json.dumps({"version": 1}))  # valid JSON, wrong shape
+    addresses = _load_stablecoin_addresses(str(config))
+    assert addresses == set()
+    assert "warning" in capsys.readouterr().err.lower()
+
+
+# ---- relative_annualized_volatility (the non-stablecoin-pair fix) ----
+
+DAY_MS = 24 * 60 * 60 * 1000
+
+
+def make_klines_at(times, closes):
+    """Kline rows with explicit open-time (ms) and close price -- for alignment/coverage tests."""
+    return [[t, "0", "0", "0", str(c), "0", t] for t, c in zip(times, closes)]
+
+
+def test_relative_volatility_zero_when_ratio_constant():
+    # stock and quote move in lockstep -> the ratio series is flat -> zero relative vol,
+    # even though each leg individually has nonzero volatility. 30 densely-spaced points to
+    # clear both the sample-count and coverage floors.
+    times = [i * DAY_MS for i in range(30)]
+    stock = make_klines_at(times, [100 * (1.05 ** i) for i in range(30)])
+    quote = make_klines_at(times, [10 * (1.05 ** i) for i in range(30)])
+    result = relative_annualized_volatility(stock, quote)
+    assert result["sigma"] == pytest.approx(0.0, abs=1e-6)
+    assert result["sample_count"] == 30
+    assert result["coverage_ratio"] == pytest.approx(1.0)
+    assert result["latest_candle_at"] == times[-1]
+
+
+def test_relative_volatility_positive_when_ratio_varies():
+    times = [i * DAY_MS for i in range(30)]
+    stock_closes = [100, 105, 98, 110, 95, 103] * 5
+    stock = make_klines_at(times, stock_closes)
+    quote = make_klines_at(times, [10] * 30)  # flat quote -> ratio vol == stock's own vol
+    result = relative_annualized_volatility(stock, quote)
+    stock_sigma = annualized_volatility(stock)
+    assert result["sigma"] == pytest.approx(stock_sigma, rel=1e-9)
+
+
+def test_relative_volatility_none_without_overlap():
+    stock = make_klines_at(range(100, 105), [1] * 5)   # times 100..104
+    quote = make_klines_at(range(200, 205), [1] * 5)   # times 200..204, no overlap
+    result = relative_annualized_volatility(stock, quote)
+    assert result["sigma"] is None
+    assert result["sample_count"] == 0
+
+
+def test_relative_volatility_uses_only_overlapping_times():
+    # quote has extra early candles the stock doesn't -- must not crash, must use only the overlap
+    n = 30
+    times = [i * DAY_MS for i in range(n)]
+    stock = make_klines_at(times, [100 * (1.02 ** i) for i in range(n)])
+    extra_times = [-DAY_MS * k for k in range(1, 6)]  # 5 extra early candles stock doesn't have
+    quote = make_klines_at(extra_times + times, [5] * 5 + [10 * (1.01 ** i) for i in range(n)])
+    result = relative_annualized_volatility(stock, quote)
+    assert result["sigma"] is not None and result["sigma"] >= 0
+    assert result["sample_count"] == n
+
+
+def test_relative_volatility_none_when_too_few_aligned_samples():
+    n = 10  # below MIN_ALIGNED_SAMPLES
+    times = [i * DAY_MS for i in range(n)]
+    stock = make_klines_at(times, [100 * (1.03 ** i) for i in range(n)])
+    quote = make_klines_at(times, [10] * n)
+    result = relative_annualized_volatility(stock, quote)
+    assert result["sigma"] is None
+    assert result["sample_count"] == n
+    assert "need >=" in result["reason"]
+
+
+def test_relative_volatility_none_when_coverage_too_sparse():
+    n = 30  # clears the sample-count floor on its own
+    times = [i * DAY_MS * 10 for i in range(n)]  # 10-day gaps between aligned candles
+    stock = make_klines_at(times, [100 * (1.01 ** i) for i in range(n)])
+    quote = make_klines_at(times, [10] * n)
+    result = relative_annualized_volatility(stock, quote)
+    assert result["sigma"] is None
+    assert result["coverage_ratio"] == pytest.approx(0.1, rel=0.05)
+    assert "coverage" in result["reason"]
+
+
+# ---- resolve_pool_apy / resolve_pool_tvl ----
+
+def test_resolve_pool_apy_prefers_info_apy():
+    assert resolve_pool_apy({"apy": "9.9"}, {"apy": "0.5"}) == 0.5
+
+
+def test_resolve_pool_apy_falls_back_to_apy_bps():
+    assert resolve_pool_apy({}, {"apyBps": "3000"}) == 0.3
+
+
+def test_resolve_pool_apy_falls_back_to_pool_apy_when_info_has_neither():
+    # Confirmed live as a real divergence bug: pool_risk_flags used to re-derive apy from
+    # `info` alone (missing this third tier), so a pool whose info carried neither apy nor
+    # apyBps would silently score apy=0.0 in the peer-outlier check while every other reading
+    # of the same pool (via this function) found the real value from `pool`.
+    assert resolve_pool_apy({"apy": "0.42"}, {}) == pytest.approx(0.42)
+
+
+def test_resolve_pool_apy_defaults_to_zero_when_nothing_available():
+    assert resolve_pool_apy({}, {}) == 0.0
+
+
+def test_resolve_pool_tvl_prefers_pool_tvl():
+    assert resolve_pool_tvl({"tvl": "100"}, {"tvl": "200"}) == 100.0
+
+
+def test_resolve_pool_tvl_falls_back_to_info_tvl():
+    assert resolve_pool_tvl({}, {"tvl": "200"}) == 200.0
+
+
+def test_resolve_pool_tvl_defaults_to_zero_when_neither_available():
+    assert resolve_pool_tvl({}, {}) == 0.0
+
+
+# ---- resolve_pool_stock_and_quote ----
+
+STOCK_INDEX = {
+    ("56", "0xaaa"): {"ticker": "NVDA", "symbol": "NVDAB", "chainId": "56", "contractAddress": "0xaaa"},
+    ("56", "0xbbb"): {"ticker": "HOOD", "symbol": "HOODB", "chainId": "56", "contractAddress": "0xbbb"},
+}
+
+
+def test_resolve_pool_stock_and_quote_stablecoin_pair():
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"},
+        {"tokenAddress": "0x55d398326f99059ff775485246999027b3197955", "tokenSymbol": "USDT"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock["ticker"] == "NVDA"
+    assert pair_mode == "stablecoin"
+
+
+def test_resolve_pool_stock_and_quote_non_stablecoin_pair():
+    # this is the exact NVDAB-BNB / BNB-SPCXB / HOODB-BNB case from the review
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"},
+        {"tokenAddress": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", "tokenSymbol": "BNB"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock["ticker"] == "NVDA"
+    assert pair_mode == "non_stablecoin"
+
+
+def test_resolve_pool_stock_and_quote_no_confirmed_bstock():
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xzzz", "tokenSymbol": "RANDOM"},
+        {"tokenAddress": "0x55d398326f99059ff775485246999027b3197955", "tokenSymbol": "USDT"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock is None
+    assert pair_mode == "unsupported"
+
+
+def test_resolve_pool_stock_and_quote_no_second_token():
+    # only 1 unique asset -- not a 2-asset pool this tool can model
+    info = {"binanceChainId": "56", "assetTokenList": [{"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"}]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock is None
+    assert pair_mode == "unsupported"
+
+
+def test_resolve_pool_stock_and_quote_three_assets_unsupported():
+    # a 3-asset weighted pool -- the two-asset E[IL] ~ sigma^2/8 model doesn't generalize to this
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"},
+        {"tokenAddress": "0x55d398326f99059ff775485246999027b3197955", "tokenSymbol": "USDT"},
+        {"tokenAddress": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", "tokenSymbol": "BNB"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock is None
+    assert pair_mode == "unsupported"
+
+
+def test_resolve_pool_stock_and_quote_dual_bstock_unsupported():
+    # two confirmed bStocks in the same pool -- ambiguous which one is "the" stock leg
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"},
+        {"tokenAddress": "0xbbb", "tokenSymbol": "HOODB"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock is None
+    assert pair_mode == "unsupported"
+
+
+def test_resolve_pool_stock_and_quote_duplicate_address_unsupported():
+    # same token listed twice (data glitch) -- only 1 unique asset, not a real 2-asset pool
+    info = {"binanceChainId": "56", "assetTokenList": [
+        {"tokenAddress": "0xaaa", "tokenSymbol": "NVDAB"},
+        {"tokenAddress": "0xAAA", "tokenSymbol": "NVDAB"},
+    ]}
+    stock, chain_id, quote_addr, pair_mode = resolve_pool_stock_and_quote({}, info, STOCK_INDEX)
+    assert stock is None
+    assert pair_mode == "unsupported"
+
+
+# ---- pool_risk_flags: V4 hard block ----
+
+def test_pool_risk_flags_blocks_v4_by_default():
+    pool = {"tvl": "50000", "protocolName": "Uniswap V4"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    flags = pool_risk_flags(pool, info, 0.5)
+    assert any("V4" in f for f in flags)
+
+
+def test_pool_risk_flags_v4_block_is_case_insensitive_and_checks_info_too():
+    pool = {"tvl": "50000"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003", "protocolName": "uniswap v4"}
+    flags = pool_risk_flags(pool, info, 0.5)
+    assert any("v4" in f.lower() for f in flags)
+
+
+def test_pool_risk_flags_v3_not_blocked():
+    pool = {"tvl": "50000", "protocolName": "Uniswap V3"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    assert pool_risk_flags(pool, info, 0.5) == []
+
+
+def test_pool_risk_flags_v4_override_disables_block():
+    pool = {"tvl": "50000", "protocolName": "Uniswap V4"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    flags = pool_risk_flags(pool, info, 0.5, block_unknown_v4_hooks=False)
+    assert flags == []
+
+
+def test_pool_risk_flags_blocks_v4_by_defi_protocol_id_even_without_v4_in_name():
+    # PancakeSwap's own V4 is marketed as "PancakeSwap Infinity" -- no "v4"/"V4" substring
+    # anywhere in the display name. A pure name-match would silently miss this (confirmed live:
+    # defiProtocolId="pancakeswap4", protocolName="PancakeSwap Infinity", real pools on BSC).
+    pool = {"tvl": "50000", "protocolName": "PancakeSwap Infinity", "defiProtocolId": "pancakeswap4"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    flags = pool_risk_flags(pool, info, 0.5)
+    assert any("V4-generation" in f for f in flags)
+
+
+def test_pool_risk_flags_v3_not_blocked_by_defi_protocol_id():
+    pool = {"tvl": "50000", "protocolName": "PancakeSwap V3", "defiProtocolId": "pancakeswap3"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    assert pool_risk_flags(pool, info, 0.5) == []
+
+
+def test_pool_risk_flags_falls_back_to_name_match_without_defi_protocol_id():
+    # no defiProtocolId at all -- must not silently disable the check
+    pool = {"tvl": "50000", "protocolName": "Some New V4 Fork"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    flags = pool_risk_flags(pool, info, 0.5)
+    assert any("V4-generation" in f for f in flags)
+
+
+# ---- evaluate_pool ----
+
+def test_evaluate_pool_clean_returns_no_flags_and_scored_data():
+    pool = {"tvl": "50000", "protocolName": "PancakeSwap V3"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    result = evaluate_pool(pool, info, sigma=0.4, apy=0.5)
+    assert result["flags"] == []
+    assert result["scored"]["apy"] == 0.5
+    assert "vol_ratio" in result["scored"]
+
+
+def test_evaluate_pool_scored_uses_model_net_apy_key_not_net_apy():
+    # the field is named model_net_apy (not net_apy) precisely so it doesn't read as a
+    # promised/realized return -- see MODEL_APY_CAVEAT. Lock in the contract.
+    pool = {"tvl": "50000", "protocolName": "PancakeSwap V3"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    result = evaluate_pool(pool, info, sigma=0.4, apy=0.5)
+    assert "model_net_apy" in result["scored"]
+    assert "net_apy" not in result["scored"]
+
+
+def test_evaluate_pool_flagged_still_returns_scored_for_transparency():
+    pool = {"tvl": "50000", "protocolName": "Uniswap V4"}
+    info = {"tvl": "50000", "apy": "0.5", "feeRate": "0.003"}
+    result = evaluate_pool(pool, info, sigma=0.4, apy=0.5)
+    assert result["flags"] != []
+    assert result["scored"]["apy"] == 0.5  # still computed, caller decides whether to show it
+
+
+# ---- _peer_apys_for_ticker (rebalance-check's fallback path getting real peer context) ----
+
+def test_peer_apys_for_ticker_filters_by_ticker_and_excludes_self():
+    market_results = [
+        {"stock_ticker": "NVDA", "investmentId": "a", "apy": 0.3},
+        {"stock_ticker": "NVDA", "investmentId": "b", "apy": 0.5},
+        {"stock_ticker": "TSLA", "investmentId": "c", "apy": 0.9},
+    ]
+    peers = _peer_apys_for_ticker("NVDA", market_results, exclude_investment_id="a")
+    assert peers == [0.5]
+
+
+def test_peer_apys_for_ticker_empty_when_no_other_pools_on_ticker():
+    market_results = [{"stock_ticker": "NVDA", "investmentId": "a", "apy": 0.3}]
+    assert _peer_apys_for_ticker("NVDA", market_results, exclude_investment_id="a") == []
+
+
+# ---- _best_alternative_for_ticker / _switching_recommendation (rebalance-check's concrete
+# best_alternative + switching-cost/payback feature) ----
+
+def test_best_alternative_for_ticker_picks_lowest_vol_ratio():
+    market_results = [
+        {"stock_ticker": "NVDA", "investmentId": "a", "vol_ratio": 0.5},
+        {"stock_ticker": "NVDA", "investmentId": "b", "vol_ratio": 0.2},
+        {"stock_ticker": "TSLA", "investmentId": "c", "vol_ratio": 0.1},
+    ]
+    best = _best_alternative_for_ticker("NVDA", market_results)
+    assert best["investmentId"] == "b"
+
+
+def test_best_alternative_for_ticker_excludes_held_ids():
+    market_results = [
+        {"stock_ticker": "NVDA", "investmentId": "a", "vol_ratio": 0.2},
+        {"stock_ticker": "NVDA", "investmentId": "b", "vol_ratio": 0.5},
+    ]
+    best = _best_alternative_for_ticker("NVDA", market_results, exclude_investment_ids={"a"})
+    assert best["investmentId"] == "b"
+
+
+def test_best_alternative_for_ticker_none_when_no_candidates():
+    market_results = [{"stock_ticker": "NVDA", "investmentId": "a", "vol_ratio": 0.2}]
+    assert _best_alternative_for_ticker("NVDA", market_results, exclude_investment_ids={"a"}) is None
+    assert _best_alternative_for_ticker("TSLA", market_results) is None
+
+
+def test_switching_recommendation_switch_for_large_gap_on_big_position():
+    # $50k position, 20pp apy gap -> $10k/yr gap, trivially pays back a ~$2 assumed cost
+    result = _switching_recommendation(position_usd=50_000, held_model_net_apy=0.05, alt_model_net_apy=0.25)
+    assert result["verdict"] == "switch"
+    assert result["payback_days"] < 1
+    assert result["annual_gap_usd"] == pytest.approx(10_000)
+
+
+def test_switching_recommendation_stay_when_alternative_is_worse():
+    result = _switching_recommendation(position_usd=50_000, held_model_net_apy=0.25, alt_model_net_apy=0.05)
+    assert result["verdict"] == "stay"
+    assert result["payback_days"] is None
+    assert result["annual_gap_usd"] < 0
+
+
+def test_switching_recommendation_stay_when_payback_too_slow():
+    # tiny position, tiny gap -> years to pay back the assumed switching cost
+    result = _switching_recommendation(position_usd=10, held_model_net_apy=0.05, alt_model_net_apy=0.06)
+    assert result["verdict"] == "stay"
+    assert result["payback_days"] > SWITCH_PAYBACK_DAYS_WORTHWHILE
+
+
+# ---- _classify_fetch_error ----
+
+def test_classify_fetch_error_checks_cause_not_just_the_wrapper():
+    # Confirmed live: api._get wraps every failure -- including a genuine timeout or connection
+    # error -- into a plain RuntimeError via `raise RuntimeError(...) from last_error` before it
+    # reaches this classifier. Since RuntimeError isn't a subclass of TimeoutError/URLError/
+    # ConnectionError, the isinstance checks against `e` alone never matched a kline-fetch
+    # failure -- this locks in that `__cause__` (set by `raise ... from ...`) is checked too.
+    import urllib.error
+
+    try:
+        raise RuntimeError("wrapped") from TimeoutError("timed out")
+    except RuntimeError as wrapped:
+        assert _classify_fetch_error(wrapped) == "timeout"
+
+    try:
+        raise RuntimeError("wrapped") from urllib.error.URLError("network unreachable")
+    except RuntimeError as wrapped:
+        assert _classify_fetch_error(wrapped) == "network error"
+
+    # a RuntimeError with no informative cause still falls through to the generic bucket
+    assert _classify_fetch_error(RuntimeError("something else")) == "error"
+
+
+# ---- _summarize_unscoreable (failure_summary for run_scan's concurrent fetch handling) ----
+
+def test_summarize_unscoreable_counts_by_reason():
+    unscoreable = [
+        {"pool": "A-USDT", "reason": "investment-info fetch failed (timeout)"},
+        {"pool": "B-USDT", "reason": "investment-info fetch failed (timeout)"},
+        {"pool": "C-USDT", "reason": "could not compute volatility (insufficient kline history)"},
+    ]
+    summary = _summarize_unscoreable(unscoreable)
+    assert summary == {
+        "investment-info fetch failed (timeout)": 2,
+        "could not compute volatility (insufficient kline history)": 1,
+    }
+
+
+def test_summarize_unscoreable_empty():
+    assert _summarize_unscoreable([]) == {}
+
+
+# ---- _json_envelope (consistent success/error JSON shape) ----
+
+def test_json_envelope_has_consistent_base_fields():
+    env = _json_envelope("ok", results=[1, 2, 3])
+    assert env["schema_version"] == SCHEMA_VERSION
+    assert env["status"] == "ok"
+    assert isinstance(env["run_id"], str) and env["run_id"]
+    assert isinstance(env["as_of"], str) and env["as_of"]
+    assert env["results"] == [1, 2, 3]
+
+
+def test_json_envelope_error_and_ok_share_the_same_shape():
+    ok_env = _json_envelope("ok", positions=[])
+    error_env = _json_envelope("error", error="boom")
+    base_keys = {"schema_version", "status", "run_id", "as_of"}
+    assert base_keys.issubset(ok_env.keys())
+    assert base_keys.issubset(error_env.keys())
+    assert ok_env["status"] == "ok"
+    assert error_env["status"] == "error"
+
+
+def test_json_envelope_run_id_unique_per_call():
+    assert _json_envelope("ok")["run_id"] != _json_envelope("ok")["run_id"]
+
+
+# ---- passes_trade_gate (the NO_TRADE fix) ----
+
+def test_passes_trade_gate_true_for_rich_positive_net_apy():
+    result = {"model_net_apy": 0.5, "vol_ratio": 0.2}
+    assert passes_trade_gate(result)
+
+
+def test_passes_trade_gate_false_for_negative_net_apy():
+    result = {"model_net_apy": -0.01, "vol_ratio": 0.2}
+    assert not passes_trade_gate(result)
+
+
+def test_passes_trade_gate_false_for_cheap_grade():
+    result = {"model_net_apy": 0.1, "vol_ratio": 1.5}  # >= 1 -> Cheap
+    assert not passes_trade_gate(result)
+
+
+def test_passes_trade_gate_false_for_unknown_vol_ratio():
+    result = {"model_net_apy": 0.1, "vol_ratio": None}
+    assert not passes_trade_gate(result)
+
+
+# ---- classify_verdict (the ENTER/WATCH/NO_TRADE/UNSCOREABLE reframing) ----
+
+def test_classify_verdict_enter_when_trade_gate_passes():
+    scored = {"model_net_apy": 0.3, "vol_ratio": 0.2}
+    assert classify_verdict(scored) == VERDICT_ENTER
+
+
+def test_classify_verdict_watch_when_negative_net_apy():
+    scored = {"model_net_apy": -0.01, "vol_ratio": 0.2}
+    assert classify_verdict(scored) == VERDICT_WATCH
+
+
+def test_classify_verdict_watch_when_cheap_grade():
+    scored = {"model_net_apy": 0.1, "vol_ratio": 1.5}
+    assert classify_verdict(scored) == VERDICT_WATCH
+
+
+def test_classify_verdict_watch_when_vol_ratio_unknown():
+    scored = {"model_net_apy": 0.1, "vol_ratio": None}
+    assert classify_verdict(scored) == VERDICT_WATCH
+
+
+def test_classify_verdict_never_returns_no_trade_or_unscoreable():
+    # classify_verdict only ever sees pools that already passed the pre-deposit safety screen
+    # (run_scan assigns NO_TRADE/UNSCOREABLE directly, before this function is even called) --
+    # it should never itself produce those two labels.
+    for model_net_apy, vol_ratio in [(0.3, 0.2), (-0.5, 2.0), (0.0, None), (1.0, 0.99)]:
+        verdict = classify_verdict({"model_net_apy": model_net_apy, "vol_ratio": vol_ratio})
+        assert verdict in (VERDICT_ENTER, VERDICT_WATCH)
+
+
+# ---- CLI argument validators ----
+
+def test_positive_int_accepts_positive():
+    assert _positive_int("3") == 3
+
+
+def test_positive_int_rejects_zero_and_negative():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_int("0")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_int("-1")
+
+
+def test_nonneg_float_accepts_zero_and_positive():
+    assert _nonneg_float("0") == 0.0
+    assert _nonneg_float("5.5") == 5.5
+
+
+def test_nonneg_float_rejects_negative():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _nonneg_float("-0.01")
+
+
+def test_apy_fraction_rejects_negative():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _apy_fraction("-0.1")
+
+
+def test_apy_fraction_accepts_zero_and_reasonable_values():
+    assert _apy_fraction("0") == 0.0
+    assert _apy_fraction("0.3") == 0.3
+
+
+def test_apy_fraction_rejects_absurd_magnitude():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _apy_fraction("1000")
+
+
+def test_offset_fraction_rejects_price_crushing_offset():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _offset_fraction("-1")  # would drive price to exactly zero
+    with pytest.raises(argparse.ArgumentTypeError):
+        _offset_fraction("-5")
+
+
+def test_offset_fraction_accepts_normal_range():
+    assert _offset_fraction("0.15") == 0.15
+    assert _offset_fraction("-0.5") == -0.5
+
+
+def test_positive_band_width_rejects_negative_and_zero():
+    # Confirmed live: --band-width used _offset_fraction (which allows negative, like
+    # --target-offset legitimately can) -- a negative --band-width let range_model.range_metrics
+    # see pb <= pa several calls deeper and crash with an unhandled ValueError instead of a
+    # clean argparse error at the CLI boundary. A band's width is a magnitude, never negative.
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_band_width("-0.2")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_band_width("0")
+
+
+def test_positive_band_width_accepts_normal_range():
+    assert _positive_band_width("0.1") == 0.1
+
+
+# ---- _v4_override_reason (--allow-v4 requires a recorded reason, not a bare flag) ----
+
+def test_v4_override_reason_rejects_empty_string():
+    with pytest.raises(argparse.ArgumentTypeError):
+        _v4_override_reason("")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _v4_override_reason("   ")
+
+
+def test_v4_override_reason_accepts_and_strips_a_real_reason():
+    assert _v4_override_reason("  already audited by X  ") == "already audited by X"
+
+
+# ---- Rogers-Satchell / Yang-Zhang volatility ----
+
+def test_rogers_satchell_zero_for_flat_candle():
+    # open == high == low == close -> no intraday range -> zero contribution
+    assert _rogers_satchell_variance(100, 100, 100, 100) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_rogers_satchell_positive_for_normal_candle():
+    assert _rogers_satchell_variance(o=100, h=105, lo=98, c=102) > 0
+
+
+def test_yang_zhang_needs_at_least_3_candles():
+    assert yang_zhang_volatility(make_ohlc_klines([(100, 101, 99, 100)] * 2)) is None
+
+
+def test_yang_zhang_zero_for_perfectly_flat_series():
+    flat = [(100, 100, 100, 100)] * 10
+    sigma = yang_zhang_volatility(make_ohlc_klines(flat))
+    assert sigma == pytest.approx(0.0, abs=1e-9)
+
+
+def test_yang_zhang_positive_for_varying_series():
+    rows = [(100, 103, 98, 101), (101, 106, 99, 104), (104, 105, 96, 97),
+            (97, 102, 95, 100), (100, 108, 99, 106), (106, 107, 100, 102)]
+    sigma = yang_zhang_volatility(make_ohlc_klines(rows))
+    assert sigma is not None and sigma > 0
+
+
+def test_yang_zhang_falls_back_to_none_on_degenerate_ohlc():
+    # a zero/negative field must not crash -- best_available_volatility handles the fallback
+    rows = make_ohlc_klines([(100, 101, 99, 100), (0, 101, 99, 100), (101, 102, 100, 101)])
+    assert yang_zhang_volatility(rows) is None
+
+
+def test_best_available_volatility_prefers_yang_zhang_when_available():
+    rows = [(100, 103, 98, 101), (101, 106, 99, 104), (104, 105, 96, 97), (97, 102, 95, 100)]
+    klines = make_ohlc_klines(rows)
+    assert best_available_volatility(klines) == yang_zhang_volatility(klines)
+
+
+def test_best_available_volatility_falls_back_to_close_to_close():
+    # degenerate OHLC (a zero field) but valid closes -- yang_zhang_volatility returns None,
+    # best_available_volatility must still return the close-to-close answer, not None
+    closes = [100, 105, 98, 110, 95, 103]
+    bad_ohlc = [[i, "0", str(h), str(h - 1), str(c), "0", i] for i, (c, h) in enumerate(zip(closes, [c + 5 for c in closes]))]
+    result = best_available_volatility(bad_ohlc)
+    assert result is not None
+    assert result == annualized_volatility(bad_ohlc)
+
+
+# ---- Exact double-barrier probability, validated against Monte Carlo ----
+
+def _monte_carlo_no_exit_probability(pa, pb, sigma, years=1.0, n_paths=4000, n_steps=100, seed=1234):
+    """Reference implementation via direct discretized GBM path simulation (driftless, log-
+    space random walk) -- ground truth to validate the closed-form reflection series against.
+    Pure stdlib (random.gauss), no numpy, consistent with the rest of this project."""
+    rng = random.Random(seed)
+    dt = years / n_steps
+    step_scale = sigma * math.sqrt(dt)
+    survived = 0
+    log_pa, log_pb = math.log(pa), math.log(pb)
+    for _ in range(n_paths):
+        log_p = 0.0
+        exited = False
+        for _ in range(n_steps):
+            log_p += step_scale * rng.gauss(0, 1)
+            if log_p <= log_pa or log_p >= log_pb:
+                exited = True
+                break
+        if not exited:
+            survived += 1
+    return survived / n_paths
+
+
+@pytest.mark.parametrize("pa,pb,sigma", [
+    (0.8, 1.2, 0.3),
+    (0.5, 1.5, 0.4),
+    (0.9, 1.1, 0.5),
+    (0.7, 1.3, 0.2),
+])
+def test_exact_double_barrier_matches_monte_carlo(pa, pb, sigma):
+    exact = _exact_double_barrier_no_exit_probability(pa, pb, sigma, years=1.0)
+    mc = _monte_carlo_no_exit_probability(pa, pb, sigma, years=1.0)
+    # n_paths=4000 at p~0.5 has a standard error of ~0.008; 0.05 is a ~6-sigma margin,
+    # generous enough to not be flaky while still catching a genuinely wrong formula
+    assert abs(exact - mc) < 0.05, f"exact={exact:.4f} vs monte carlo={mc:.4f} for pa={pa} pb={pb} sigma={sigma}"
+
+
+def test_exact_double_barrier_tighter_than_union_bound():
+    # the exact probability must be >= the conservative union-bound approximation it replaced
+    # (the union bound is a proven lower bound on the true survival probability)
+    pa, pb, sigma = 0.8, 1.2, 0.4
+    exact = _exact_double_barrier_no_exit_probability(pa, pb, sigma)
+    bound = _union_bound_no_exit_probability(pa, pb, sigma)
+    assert exact >= bound - 1e-9
+
+
+def test_exact_double_barrier_bounded_zero_one():
+    for sigma in [0.1, 0.5, 1.0, 2.0, 5.0]:
+        p = _exact_double_barrier_no_exit_probability(0.9, 1.1, sigma)
+        assert 0.0 <= p <= 1.0
+
+
+def test_no_exit_probability_uses_exact_when_straddling():
+    pa, pb, sigma = 0.8, 1.2, 0.4
+    assert no_exit_probability(pa, pb, sigma) == pytest.approx(
+        _exact_double_barrier_no_exit_probability(pa, pb, sigma))
+
+
+def test_no_exit_probability_falls_back_when_not_straddling():
+    # pa >= 1 -- not a valid input to the straddling reflection formula, must use the fallback
+    result = no_exit_probability(1.1, 1.3, 0.4)
+    assert result == pytest.approx(_union_bound_no_exit_probability(1.1, 1.3, 0.4))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

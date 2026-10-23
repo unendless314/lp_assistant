@@ -1,0 +1,1021 @@
+"""Mocked integration tests: exercise run_scan/cmd_* end-to-end through baw()/_get() without
+touching the real network or a real baw session. Complements test_riskscreen.py (pure functions
+only, no I/O) -- this file is where the wiring between fetch/evaluate/report gets checked.
+
+Mocking strategy: patch the two leaf I/O functions, baw() and _get(), with fake dispatchers
+keyed by call signature. Every higher-level fetch_*/cmd_* function is exercised for real; only
+the actual subprocess spawn / HTTP request is replaced.
+"""
+
+import json
+
+import pytest
+
+from bstocks_lp import api, cli, config, market_data, range_model, scan
+
+DAY_MS = 24 * 60 * 60 * 1000
+USDT_BSC = "0x55d398326f99059ff775485246999027b3197955"
+BNB_NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+
+
+def make_price_klines(n, start_price=100.0, daily_return=0.0, start_time=0):
+    """n densely-spaced daily OHLC candles at a constant daily return -- realistic shape for
+    integration fixtures where the exact volatility number doesn't matter, only that it's
+    computable at all (clears the sample-count/coverage floors)."""
+    rows = []
+    price = start_price
+    for i in range(n):
+        t = start_time + i * DAY_MS
+        o = price
+        c = price * (1 + daily_return)
+        h = max(o, c) * 1.01
+        lo = min(o, c) * 0.99
+        rows.append([t, str(o), str(h), str(lo), str(c), "1000", t])
+        price = c
+    return rows
+
+
+class FakeBaw:
+    """Routes baw(*args) to canned responses by subcommand, so run_scan/cmd_* can run for real
+    without an actual baw session. Unrecognized calls raise loudly (AssertionError) rather than
+    silently returning something misleading."""
+
+    def __init__(self):
+        self.investment_list_page1 = []
+        self.investment_list_extra_pages: dict = {}  # page number (2+) -> pool list, default empty
+        self.investment_list_total = None  # None -> defaults to len(page1), i.e. not truncated
+        self.investment_list_omit_total = False  # True -> "total" key absent entirely from the response
+        self.investment_info = {}       # investmentId -> info dict
+        self.protocol_security_score = {}  # defiProtocolId -> score
+        self.protocol_security_score_error: set = set()  # defiProtocolId -> raise instead of a score
+        self.positions: dict = {"deFiProtocolVOList": []}
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        head = args[0] if args else None
+        if head == "defi" and args[1] == "investment-list":
+            page = int(args[args.index("--page") + 1])
+            pools = self.investment_list_page1 if page == 1 else self.investment_list_extra_pages.get(page, [])
+            data = {"list": pools}
+            if not self.investment_list_omit_total:
+                data["total"] = (self.investment_list_total if self.investment_list_total is not None
+                                  else len(self.investment_list_page1))
+            return {"success": True, "data": data}
+        if head == "defi" and args[1] == "investment-info":
+            inv_id = args[args.index("--investmentId") + 1]
+            info = self.investment_info.get(inv_id)
+            if info is None:
+                return {"success": False, "error": {"message": f"investment {inv_id} not found"}}
+            return {"success": True, "data": info}
+        if head == "defi" and args[1] == "protocol-info":
+            pid = args[args.index("--defiProtocolId") + 1]
+            if pid in self.protocol_security_score_error:
+                raise RuntimeError(f"protocol-info transient failure for {pid}")
+            score = self.protocol_security_score.get(pid, 90)
+            return {"success": True, "data": {"securityScore": score}}
+        if head == "defi" and args[1] == "position":
+            return {"success": True, "data": self.positions}
+        raise AssertionError(f"FakeBaw: unhandled call {args!r}")
+
+
+class FakeGet:
+    """Routes _get(url, params) to canned responses for the RWA stock list + kline endpoints."""
+
+    def __init__(self):
+        self.stock_tokens = []
+        self.klines = {}  # (chainId, contractAddress-lowercased) -> kline rows
+
+    def __call__(self, url, params):
+        if url == market_data.RWA_LIST_URL:
+            return {"success": True, "data": self.stock_tokens}
+        if url == market_data.KLINE_URL:
+            key = (str(params["chainId"]), params["contractAddress"].lower())
+            return {"success": True, "data": {"klineInfos": self.klines.get(key, [])}}
+        raise AssertionError(f"FakeGet: unhandled url {url!r}")
+
+
+@pytest.fixture(autouse=True)
+def _clear_memoized_fetch_caches():
+    # fetch_stock_tokens/fetch_klines are functools.lru_cache'd at module scope (deliberately,
+    # for a single real CLI process -- see bstocks_lp/market_data.py). Across tests in one
+    # pytest process that cache would leak fixture data between tests, so clear it before and
+    # after every test.
+    market_data.fetch_stock_tokens.cache_clear()
+    market_data.fetch_klines.cache_clear()
+    yield
+    market_data.fetch_stock_tokens.cache_clear()
+    market_data.fetch_klines.cache_clear()
+
+
+@pytest.fixture
+def fake_io(monkeypatch):
+    fb, fg = FakeBaw(), FakeGet()
+    monkeypatch.setattr(api, "baw", fb)
+    monkeypatch.setattr(api, "_get", fg)
+    return fb, fg
+
+
+def nvda_token():
+    return {"chainId": "56", "contractAddress": "0xaaa0000000000000000000000000000000000a",
+            "symbol": "NVDAB", "ticker": "NVDA", "type": 3, "multiplier": "1.0"}
+
+
+def gme_token():
+    return {"chainId": "56", "contractAddress": "0xbbb0000000000000000000000000000000000b",
+            "symbol": "GMEB", "ticker": "GME", "type": 3, "multiplier": "1.0"}
+
+
+def pool_entry(investment_id, name, protocol_name, defi_protocol_id, tvl="50000", apy_bps=3000):
+    return {"binanceChainId": "56", "defiProtocolId": defi_protocol_id, "protocolName": protocol_name,
+            "investmentId": investment_id, "investmentName": name, "investType": "LiquidityPool",
+            "apyType": "APR", "apy": None, "tvl": tvl, "apyBps": apy_bps,
+            "apyDisplay": f"{apy_bps / 100:.2f}%"}
+
+
+def info_entry(investment_name, protocol_name, defi_protocol_id, asset_token_list, tvl="50000",
+                fee_rate="0.0025", apy_bps=3000):
+    return {"binanceChainId": "56", "defiProtocolId": defi_protocol_id, "protocolName": protocol_name,
+            "investmentName": investment_name, "investType": "LiquidityPool", "investable": True,
+            "apy": None, "tvl": tvl, "poolAddress": "0xpool", "feeRate": fee_rate,
+            "assetTokenList": asset_token_list, "rewardTokenList": [], "apyBps": apy_bps,
+            "apyDisplay": f"{apy_bps / 100:.2f}%"}
+
+
+# ---- run_scan end-to-end ----
+
+def test_run_scan_clean_stablecoin_pool(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert unscoreable == []
+    assert flagged == []
+    assert len(results) == 1
+    assert results[0]["investmentId"] == "inv1"
+    assert results[0]["pair_mode"] == "stablecoin"
+    assert results[0]["stock_ticker"] == "NVDA"
+    assert results[0]["model_net_apy"] > 0
+    assert results[0]["verdict"] == scan.VERDICT_ENTER
+
+
+def test_run_scan_blocks_v4_generation_pool_pancakeswap_infinity_fixture(fake_io):
+    # Locks in a real finding from this session: PancakeSwap's own V4 is marketed as
+    # "PancakeSwap Infinity" with no "v4"/"V4" substring in the display name anywhere --
+    # defiProtocolId="pancakeswap4" is what actually identifies it. This is the exact live
+    # response shape observed when the defiProtocolId-based detection fix was made.
+    fb, fg = fake_io
+    fg.stock_tokens = [gme_token()]
+    fb.investment_list_page1 = [pool_entry("inv_infinity", "USDT-GMEB", "PancakeSwap Infinity", "pancakeswap4")]
+    fb.investment_info["inv_infinity"] = info_entry(
+        "USDT-GMEB", "PancakeSwap Infinity", "pancakeswap4",
+        [{"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"},
+         {"tokenAddress": gme_token()["contractAddress"], "tokenSymbol": "GMEB"}])
+    fg.klines[("56", gme_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.005)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert results == []
+    assert unscoreable == []
+    assert len(flagged) == 1
+    assert flagged[0]["investmentId"] == "inv_infinity"
+    assert any("V4-generation" in f for f in flagged[0]["flags"])
+    assert flagged[0]["verdict"] == scan.VERDICT_NO_TRADE
+
+
+def test_run_scan_allow_v4_override_unblocks_pancakeswap_infinity(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [gme_token()]
+    fb.investment_list_page1 = [pool_entry("inv_infinity", "USDT-GMEB", "PancakeSwap Infinity", "pancakeswap4")]
+    fb.investment_info["inv_infinity"] = info_entry(
+        "USDT-GMEB", "PancakeSwap Infinity", "pancakeswap4",
+        [{"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"},
+         {"tokenAddress": gme_token()["contractAddress"], "tokenSymbol": "GMEB"}])
+    fg.klines[("56", gme_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.005)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1, block_unknown_v4_hooks=False)
+
+    assert flagged == []
+    assert len(results) == 1
+    assert results[0]["investmentId"] == "inv_infinity"
+
+
+def test_run_scan_non_stablecoin_pair_scores_relative_volatility(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv_bnb", "NVDAB-BNB", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv_bnb"] = info_entry(
+        "NVDAB-BNB", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": BNB_NATIVE, "tokenSymbol": "BNB"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+    fg.klines[("56", BNB_NATIVE.lower())] = make_price_klines(60, daily_return=0.003)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert unscoreable == []
+    assert len(results) == 1
+    assert results[0]["pair_mode"] == "non_stablecoin"
+
+
+def test_run_scan_unsupported_three_asset_pool_goes_to_unscoreable(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv_three", "NVDAB-USDT-BNB", "Balancer", "balancer2")]
+    fb.investment_info["inv_three"] = info_entry(
+        "NVDAB-USDT-BNB", "Balancer", "balancer2",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"},
+         {"tokenAddress": BNB_NATIVE, "tokenSymbol": "BNB"}])
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert results == []
+    assert flagged == []
+    assert len(unscoreable) == 1
+    assert "unsupported pool structure" in unscoreable[0]["reason"]
+
+
+def test_run_scan_investment_info_fetch_failure_reported_not_dropped(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    # investmentId deliberately absent from fb.investment_info -> FakeBaw returns success=False
+    fb.investment_list_page1 = [pool_entry("inv_missing", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert results == []
+    assert flagged == []
+    assert len(unscoreable) == 1
+    assert "investment-info fetch failed" in unscoreable[0]["reason"]
+    assert unscoreable[0]["verdict"] == scan.VERDICT_UNSCOREABLE
+
+
+def test_run_scan_peer_outlier_apy_flagged(fake_io):
+    # Three normal-apy peers, not one: a median needs min_peer_sample_size (default 3) same-
+    # ticker pools before it's a reliable benchmark -- see risk_screen.MIN_PEER_SAMPLE_SIZE and
+    # the GMEB-USDT case in its docstring (a single noisy peer produced a false "6x the median").
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    normal = pool_entry("inv_normal", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", apy_bps=3000)
+    normal2 = pool_entry("inv_normal2", "NVDAB-USDT", "PancakeSwap V2", "pancakeswap2", apy_bps=3200)
+    normal3 = pool_entry("inv_normal3", "NVDAB-USDT", "Biswap", "biswap", apy_bps=2800)
+    outlier = pool_entry("inv_outlier", "NVDAB-USDT", "Uniswap V3", "uniswap3", apy_bps=100000)
+    fb.investment_list_page1 = [normal, normal2, normal3, outlier]
+    asset_list = [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+                  {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}]
+    fb.investment_info["inv_normal"] = info_entry("NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+                                                   asset_list, apy_bps=3000)
+    fb.investment_info["inv_normal2"] = info_entry("NVDAB-USDT", "PancakeSwap V2", "pancakeswap2",
+                                                     asset_list, apy_bps=3200)
+    fb.investment_info["inv_normal3"] = info_entry("NVDAB-USDT", "Biswap", "biswap",
+                                                     asset_list, apy_bps=2800)
+    fb.investment_info["inv_outlier"] = info_entry("NVDAB-USDT", "Uniswap V3", "uniswap3",
+                                                    asset_list, apy_bps=100000)
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    flagged_ids = {f["investmentId"] for f in flagged}
+    result_ids = {r["investmentId"] for r in results}
+    assert "inv_outlier" in flagged_ids
+    assert "inv_normal" in result_ids
+
+
+def test_run_scan_peer_outlier_not_flagged_with_only_one_peer(fake_io):
+    # The exact GMEB-USDT scenario: an apy that looks like a huge multiple of its only peer's
+    # apy must NOT be excluded by the peer-outlier signal alone when there aren't enough peers
+    # for "median" to mean anything -- other independent signals (feeRate, TVL, V4 hook) still
+    # apply normally and are what should catch a genuinely bad pool.
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    peer = pool_entry("inv_peer", "NVDAB-USDT", "Uniswap V4", "uniswap4", apy_bps=8500)
+    candidate = pool_entry("inv_candidate", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", apy_bps=51000)
+    fb.investment_list_page1 = [peer, candidate]
+    asset_list = [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+                  {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}]
+    fb.investment_info["inv_peer"] = info_entry("NVDAB-USDT", "Uniswap V4", "uniswap4",
+                                                 asset_list, apy_bps=8500)
+    fb.investment_info["inv_candidate"] = info_entry("NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+                                                      asset_list, apy_bps=51000)
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    flagged_ids = {f["investmentId"] for f in flagged}
+    result_ids = {r["investmentId"] for r in results}
+    # inv_peer is V4-generation and still hard-blocked on that independent signal
+    assert "inv_peer" in flagged_ids
+    # but inv_candidate is PancakeSwap V3 with a sane feeRate/TVL and only one peer to compare
+    # against -- the peer-outlier signal alone must not exclude it
+    assert "inv_candidate" in result_ids
+
+
+def test_run_scan_coverage_reports_truncation_when_max_pages_cuts_scan_short(fake_io):
+    # Real gap this locks in: answering "did the scan cover every bStock pool?" used to require
+    # a live manual investigation (see README) because nothing distinguished "max_pages cut this
+    # off, more pools may exist" from "this really is the whole market." The API's own `total`
+    # field (independent of how many pages were fetched) makes that distinction exact.
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+    fb.investment_list_total = 250  # far more pools exist system-wide than this 1-pool page
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert coverage == {"pools_fetched": 1, "pools_total": 250, "truncated": True}
+
+
+def test_run_scan_coverage_reports_complete_when_last_page_is_short(fake_io):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+    # investment_list_total defaults to len(page1) == 1 -- page came back short, so the scan
+    # already saw the entire market even though max_pages=3 was never fully used.
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=3)
+
+    assert coverage == {"pools_fetched": 1, "pools_total": 1, "truncated": False}
+
+
+def test_run_scan_routes_unscoreable_il_to_unscoreable_not_a_fake_verdict(fake_io):
+    # Real bug this locks in, end to end: a pool volatile enough that expected_il_fraction can't
+    # produce a valid model_net_apy (see il_model.py) must not crash run_scan's sort()/verdict
+    # classification, and must not silently get labeled ENTER or WATCH with a net_apy that
+    # doesn't actually exist -- it belongs in `unscoreable`, the same bucket as any other "we
+    # resolved sigma/apy but still couldn't score this" case.
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    # Alternating +40%/-32% daily swings -> annualized sigma ~= 304%, comfortably past the
+    # sqrt(8) ~= 283% threshold where the diffusion IL approximation stops being valid.
+    rows = []
+    price, t = 100.0, 0
+    for r in [0.40, -0.32] * 30:
+        o = price
+        c = price * (1 + r)
+        h, lo = max(o, c) * 1.01, min(o, c) * 0.99
+        rows.append([t, str(o), str(h), str(lo), str(c), "1000", t])
+        price, t = c, t + DAY_MS
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = rows
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert results == []
+    assert flagged == []
+    assert len(unscoreable) == 1
+    assert "volatility too extreme" in unscoreable[0]["reason"]
+    assert unscoreable[0]["verdict"] == scan.VERDICT_UNSCOREABLE
+
+
+# ---- fetch_lp_investments: concurrent multi-page fetch ----
+
+def test_fetch_lp_investments_fetches_additional_pages_concurrently_when_page_one_is_full(fake_io):
+    # Real perf fix this locks in: page 2+ used to be fetched one at a time inside a `for page in
+    # range(...)` loop -- each a separate `baw` subprocess spawn, pure sequential wait for calls
+    # that don't depend on each other. Now page 1 alone determines pools_total, then only the
+    # pages that could actually exist (capped by both max_pages and ceil(pools_total/100)) are
+    # fetched concurrently.
+    fb, fg = fake_io
+    fb.investment_list_page1 = [pool_entry(f"inv{i}", f"P{i}-USDT", "PancakeSwap V3", "pancakeswap3")
+                                 for i in range(100)]
+    fb.investment_list_extra_pages = {
+        2: [pool_entry(f"inv2_{i}", f"Q{i}-USDT", "PancakeSwap V3", "pancakeswap3") for i in range(50)],
+        3: [pool_entry("inv3_should_not_be_fetched", "R-USDT", "PancakeSwap V3", "pancakeswap3")],
+    }
+    fb.investment_list_total = 150  # only 2 pages' worth actually exist -- page 3 must not be requested
+
+    pools, total = market_data.fetch_lp_investments(max_pages=5)
+
+    assert total == 150
+    assert len(pools) == 150  # page 1 (100) + page 2 (50)
+    page_requests = [c for c in fb.calls if c[0] == "defi" and c[1] == "investment-list"]
+    pages_requested = {c[c.index("--page") + 1] for c in page_requests}
+    assert pages_requested == {"1", "2"}  # capped at ceil(150/100)=2 -- page 3 never requested
+
+
+def test_fetch_lp_investments_stops_at_max_pages_even_when_more_exist(fake_io):
+    fb, fg = fake_io
+    fb.investment_list_page1 = [pool_entry(f"inv{i}", f"P{i}-USDT", "PancakeSwap V3", "pancakeswap3")
+                                 for i in range(100)]
+    fb.investment_list_extra_pages = {
+        2: [pool_entry(f"inv2_{i}", f"Q{i}-USDT", "PancakeSwap V3", "pancakeswap3") for i in range(100)],
+        3: [pool_entry("inv3_should_not_be_fetched", "R-USDT", "PancakeSwap V3", "pancakeswap3")],
+    }
+    fb.investment_list_total = 300  # 3 pages exist, but max_pages=2 caps the fetch
+
+    pools, total = market_data.fetch_lp_investments(max_pages=2)
+
+    assert total == 300
+    assert len(pools) == 200
+    page_requests = [c for c in fb.calls if c[0] == "defi" and c[1] == "investment-list"]
+    pages_requested = {c[c.index("--page") + 1] for c in page_requests}
+    assert pages_requested == {"1", "2"}
+
+
+def test_fetch_lp_investments_keeps_fetching_when_total_is_omitted(fake_io):
+    # Confirmed live as a real bug: pools_total used to default to 0 when the API response
+    # omitted "total" entirely, which made needed_pages = ceil(0/100) = 0 -- pagination
+    # silently stopped after page 1 even though it came back completely full. Now a missing
+    # total falls back to fetching up to max_pages, and pools_total comes back None so the
+    # caller can tell "unknown" apart from "confirmed zero more pools".
+    fb, fg = fake_io
+    fb.investment_list_page1 = [pool_entry(f"inv{i}", f"P{i}-USDT", "PancakeSwap V3", "pancakeswap3")
+                                 for i in range(100)]
+    fb.investment_list_extra_pages = {
+        2: [pool_entry(f"inv2_{i}", f"Q{i}-USDT", "PancakeSwap V3", "pancakeswap3") for i in range(50)],
+    }
+    fb.investment_list_omit_total = True
+
+    pools, total = market_data.fetch_lp_investments(max_pages=3)
+
+    assert total is None
+    assert len(pools) == 150  # page 1 (100, full) + page 2 (50, short) -- page 3's data unused
+    # Pages 2 and 3 are requested concurrently up front, before page 2's short length is known
+    # (total is genuinely unknown, so this fetches up to max_pages, the safe direction) -- the
+    # old bug is that page 2 wouldn't even have been *requested*, stopping at just {"1"}.
+    page_requests = [c for c in fb.calls if c[0] == "defi" and c[1] == "investment-list"]
+    pages_requested = {c[c.index("--page") + 1] for c in page_requests}
+    assert pages_requested == {"1", "2", "3"}
+
+
+def test_run_scan_coverage_reports_truncated_when_total_is_unknown_and_page_cap_hit(fake_io):
+    # The scan.py half of the same fix: pools_total=None with a full max_pages*100 worth of
+    # pools fetched must report truncated=True (coverage can't be verified as complete), not
+    # the old false "truncated=False" that a defaulted-to-0 total used to produce.
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry(f"inv{i}", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")
+                                 for i in range(100)]
+    fb.investment_list_omit_total = True
+    asset_list = [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+                  {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}]
+    for i in range(100):
+        fb.investment_info[f"inv{i}"] = info_entry("NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", asset_list)
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert coverage["pools_total"] is None
+    assert coverage["truncated"] is True
+
+
+# ---- malformed / missing / type-drifted API responses ----
+
+def test_fetch_stock_tokens_raises_clear_error_on_missing_success_field(fake_io, monkeypatch):
+    fb, fg = fake_io
+    monkeypatch.setattr(api, "_get", lambda url, params: {"data": []})  # no "success" key
+    with pytest.raises(RuntimeError, match="RWA list fetch failed"):
+        market_data.fetch_stock_tokens()
+
+
+def test_fetch_klines_raises_clear_error_on_failed_body(fake_io, monkeypatch):
+    monkeypatch.setattr(api, "_get", lambda url, params: {"success": False, "error": "boom"})
+    with pytest.raises(RuntimeError, match="kline fetch failed"):
+        market_data.fetch_klines("56", "0xabc")
+
+
+def test_fetch_investment_info_raises_on_baw_error_envelope(fake_io):
+    fb, fg = fake_io
+    # investmentId not registered -> FakeBaw's own {"success": False, ...} envelope
+    with pytest.raises(RuntimeError):
+        market_data.fetch_investment_info("does-not-exist")
+
+
+def test_fetch_protocol_security_score_raises_instead_of_swallowing():
+    # Confirmed live: this used to catch every exception and return None, indistinguishable
+    # downstream from "this protocol legitimately has no securityScore" -- pool_risk_flags
+    # treats None as "nothing to check", silently skipping the floor rather than flagging it as
+    # unverified. Now it raises, and callers (run_scan, _evaluate_held_investment_id) are
+    # responsible for treating a failed fetch as "unknown, not safe" instead.
+    def boom(*args):
+        raise RuntimeError("protocol-info transient failure")
+    import bstocks_lp.api as real_api
+    orig = real_api.baw
+    real_api.baw = boom
+    try:
+        with pytest.raises(RuntimeError):
+            market_data.fetch_protocol_security_score("pancakeswap3", {})
+    finally:
+        real_api.baw = orig
+
+
+def test_run_scan_flags_pool_when_security_score_fetch_fails(fake_io):
+    # scan.py's half of the same fix: a protocol whose security-score fetch failed must not
+    # silently score its pools as if the check passed -- confirmed live this was a real
+    # fail-open path (a network blip could let a genuinely disreputable protocol's pool through
+    # with zero warning).
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    asset_list = [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+                  {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}]
+    fb.investment_info["inv1"] = info_entry("NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", asset_list)
+    fb.protocol_security_score_error = {"pancakeswap3"}
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert not results  # must not silently pass through as if the score check succeeded
+    assert len(flagged) == 1
+    assert any("could not be fetched" in f for f in flagged[0]["flags"])
+
+
+def test_run_scan_one_malformed_pool_does_not_abort_the_whole_batch(fake_io):
+    # Confirmed live: pool_risk_flags's tvl/apy float() coercion had no try/except around it
+    # (unlike feeRate/security-score two lines away, which do), and Pass 2's scoring loop called
+    # it with no try/except of its own either -- a single pool with a non-numeric tvl/apy field
+    # used to raise ValueError uncaught, aborting scoring for every pool in the batch, not just
+    # the malformed one. Now it's isolated into `unscoreable`, same as Pass 1's own per-pool
+    # error handling for the identical class of problem.
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [
+        # resolve_pool_tvl checks `pool`'s own tvl first (falling back to `info` only when
+        # pool's is missing) -- the malformed value has to be here to actually be reached.
+        pool_entry("bad", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", tvl="not-a-number"),
+        pool_entry("good", "NVDAB-BNB", "PancakeSwap V3", "pancakeswap3"),
+    ]
+    nvda = nvda_token()
+    usdt_asset_list = [{"tokenAddress": nvda["contractAddress"], "tokenSymbol": "NVDAB"},
+                        {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}]
+    bnb_asset_list = [{"tokenAddress": nvda["contractAddress"], "tokenSymbol": "NVDAB"},
+                       {"tokenAddress": BNB_NATIVE, "tokenSymbol": "BNB"}]
+    fb.investment_info["bad"] = info_entry("NVDAB-USDT", "PancakeSwap V3", "pancakeswap3", usdt_asset_list)
+    fb.investment_info["good"] = info_entry("NVDAB-BNB", "PancakeSwap V3", "pancakeswap3", bnb_asset_list)
+    fg.klines[("56", nvda["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+    fg.klines[("56", BNB_NATIVE.lower())] = make_price_klines(60, daily_return=0.003)  # distinct rate --
+    # identical returns on both legs make the price *ratio* constant (sigma=0), a degenerate
+    # case unrelated to what this test is actually checking.
+
+    results, flagged, unscoreable, coverage = scan.run_scan(max_pages=1)
+
+    assert any(u["pool"] == "NVDAB-USDT" and "could not evaluate risk screen" in u["reason"]
+               for u in unscoreable)
+    assert any(r["pool"] == "NVDAB-BNB" for r in results)  # the other pool still scored normally
+
+
+# ---- baw() itself: subprocess-level failures, without a real subprocess ----
+
+def test_baw_raises_clear_error_on_nonzero_exit_no_json(monkeypatch):
+    class FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: not signed in"
+
+    monkeypatch.setattr(api, "_resolve_baw_path", lambda: "C:\\fake\\baw.CMD")
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: FakeCompletedProcess())
+
+    with pytest.raises(RuntimeError, match="not signed in"):
+        api.baw("defi", "position")
+
+
+def test_baw_rejects_shell_metacharacters_before_touching_subprocess(monkeypatch):
+    calls = []
+    monkeypatch.setattr(api, "_resolve_baw_path", lambda: "C:\\fake\\baw.CMD")
+    monkeypatch.setattr(api.subprocess, "run", lambda *a, **k: calls.append(1))
+
+    with pytest.raises(ValueError):
+        api.baw("defi", "investment-info", "--investmentId", "123 & calc.exe")
+    assert calls == []  # subprocess.run must never have been reached
+
+
+# ---- JSON stdout contract: valid JSON, consistent envelope, nothing else on stdout ----
+
+def test_scan_json_is_pure_json_with_envelope(fake_io, capsys):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    args = cli.build_parser().parse_args(["scan", "--top", "5", "--json"])
+    cli.cmd_scan(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)  # raises if anything but pure JSON was on stdout
+    assert data["schema_version"] == config.SCHEMA_VERSION
+    assert data["status"] == "ok"
+    assert "run_id" in data and "as_of" in data
+    assert len(data["results"]) == 1
+    assert data["coverage"] == {"pools_fetched": 1, "pools_total": 1, "truncated": False}
+    assert data["dyor_disclaimer"] == config.DYOR_DISCLAIMER
+
+
+def test_scan_text_output_notes_truncated_coverage(fake_io, capsys):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_list_page1 = [pool_entry("inv1", "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3")]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}])
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+    fb.investment_list_total = 250  # 1-page scan is only a fraction of the full market
+
+    args = cli.build_parser().parse_args(["scan", "--top", "5", "--max-pages", "1"])
+    cli.cmd_scan(args)
+
+    out = capsys.readouterr().out
+    assert "scanned 1/250 LP pools" in out
+    assert "249 more exist" in out
+    assert "Always DYOR" in out  # every text-mode command that judges a pool must carry this
+
+
+def test_positions_json_is_pure_json_with_envelope(fake_io, capsys):
+    fb, fg = fake_io
+    fg.stock_tokens = []
+    fb.positions = {"deFiProtocolVOList": [], "deFiTotalValue": "0"}
+
+    args = cli.build_parser().parse_args(["positions", "--json"])
+    cli.cmd_positions(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "ok"
+    assert data["positions"] == []
+
+
+def test_rebalance_check_json_error_envelope_on_position_fetch_failure(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise RuntimeError("session expired")
+    monkeypatch.setattr(market_data, "fetch_positions", boom)
+
+    args = cli.build_parser().parse_args(["rebalance-check", "--json"])
+    with pytest.raises(SystemExit):
+        cli.cmd_rebalance_check(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "error"
+    assert data["schema_version"] == config.SCHEMA_VERSION
+    assert "session expired" in data["error"]
+
+
+# ---- range: explicit IL column + per-row capital simulation ----
+
+def test_range_text_output_shows_il_column_and_capital_simulation(fake_io, capsys):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}], apy_bps=3000)
+    # alternating returns for a real, non-zero sigma (a constant daily_return gives sigma=0,
+    # which would make every range width look equally "safe" and defeat the point of this test)
+    returns = [0.02, -0.015] * 30
+    rows = []
+    price = 100.0
+    t = 0
+    for r in returns:
+        o = price
+        c = price * (1 + r)
+        h = max(o, c) * 1.01
+        lo = min(o, c) * 0.99
+        rows.append([t, str(o), str(h), str(lo), str(c), "1000", t])
+        price = c
+        t += DAY_MS
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = rows
+
+    args = cli.build_parser().parse_args(
+        ["range", "--investmentId", "inv1", "--capital", "10000"])
+    cli.cmd_range(args)
+
+    out = capsys.readouterr().out
+    header_line = next(line for line in out.splitlines() if "concentration" in line and "il" in line)
+    il_col = header_line.index("il")
+    net_apy_col = header_line.index("net_apy")
+    assert il_col < net_apy_col  # il column comes before net_apy, as documented
+    assert "$/yr @10,000" in out
+    # every data row (marked by a leading "+/-" or "full") should carry a dollar figure
+    data_lines = [line for line in out.splitlines() if line.strip().startswith(("+/-", "full"))]
+    assert len(data_lines) >= 5
+    for line in data_lines:
+        assert "%" in line  # il/net_apy percentages present
+    assert "model estimate, not a promised return" in out
+    assert "Always DYOR" in out  # cmd_range must carry the disclaimer too, not just scan/recommend
+    # Real point of confusion this locks in: at this fixture's sigma (~43%), the narrowest
+    # preset ranges have Low confidence (near-zero p_active) alongside a small `il` figure --
+    # a user reading `il` alone could mistake that for safety. The clarifying note must appear.
+    assert "not by itself a safety signal" in out
+
+
+def test_range_investment_id_now_catches_low_protocol_security_score(fake_io, capsys):
+    # Confirmed live as a real gap: `range --investmentId` used to call pool_risk_flags()
+    # directly instead of evaluate_pool(), with no protocol_security_score ever fetched -- a
+    # pool `scan` would flag and exclude for a disreputable protocol could be looked up here
+    # with zero warning, showing a full range breakdown as if it had cleared the complete
+    # screen. Now it fetches the score too (peer_apys is still skipped -- no market context for
+    # a single-pool lookup -- but this half of the gap is closed).
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}], apy_bps=3000)
+    fb.protocol_security_score["pancakeswap3"] = 10  # well below the 50 floor
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = make_price_klines(60, daily_return=0.01)
+
+    args = cli.build_parser().parse_args(["range", "--investmentId", "inv1"])
+    cli.cmd_range(args)
+
+    err = capsys.readouterr().err
+    assert "failed the pre-deposit screen" in err
+    assert "security score" in err
+
+
+def test_range_straddle_omits_narrow_range_caveat_when_nothing_is_low_confidence(fake_io, capsys):
+    fb, fg = fake_io
+    fg.stock_tokens = [nvda_token()]
+    fb.investment_info["inv1"] = info_entry(
+        "NVDAB-USDT", "PancakeSwap V3", "pancakeswap3",
+        [{"tokenAddress": nvda_token()["contractAddress"], "tokenSymbol": "NVDAB"},
+         {"tokenAddress": USDT_BSC, "tokenSymbol": "USDT"}], apy_bps=3000)
+    # Flat candles (open == close, no intraday range) -> sigma close to 0 -> every preset width,
+    # even +/-5%, comfortably clears the p_active safety floor. The narrow-range caveat is only
+    # relevant when some row is actually Low confidence -- it must not print unconditionally.
+    returns = [0.0003, -0.0002] * 30
+    rows = []
+    price, t = 100.0, 0
+    for r in returns:
+        o = price
+        c = price * (1 + r)
+        rows.append([t, str(o), str(o), str(o), str(c), "1000", t])
+        price, t = c, t + DAY_MS
+    fg.klines[("56", nvda_token()["contractAddress"].lower())] = rows
+
+    args = cli.build_parser().parse_args(["range", "--investmentId", "inv1"])
+    cli.cmd_range(args)
+
+    out = capsys.readouterr().out
+    assert "not by itself a safety signal" not in out
+
+
+# ---- recommend: NO_TRADE, refuse-threshold, position-fetch-failure ----
+
+FAKE_FULL_COVERAGE = {"pools_fetched": 1, "pools_total": 1, "truncated": False}
+
+
+def test_recommend_no_trade_when_nothing_passes_gate(monkeypatch, capsys):
+    negative_apy_result = {
+        "pool": "NVDAB-USDT", "stock_ticker": "NVDA", "investmentId": "inv1",
+        "grade": "Cheap", "model_net_apy": -0.02, "vol_ratio": 1.5, "tvl": 50000,
+        "pair_mode": "stablecoin", "verdict": scan.VERDICT_WATCH,
+    }
+    monkeypatch.setattr(scan, "run_scan",
+                         lambda **kw: ([negative_apy_result], [], [], FAKE_FULL_COVERAGE))
+
+    args = cli.build_parser().parse_args(["recommend"])
+    cli.cmd_recommend(args)
+
+    out = capsys.readouterr().out
+    assert "NO_TRADE" in out
+    assert "Not a recommendation" in out
+    assert "Always DYOR" in out  # every cmd_recommend exit path must carry the disclaimer
+
+
+def test_recommend_refuses_when_unscoreable_ratio_too_high(monkeypatch, capsys):
+    ok_result = {
+        "pool": "NVDAB-USDT", "stock_ticker": "NVDA", "investmentId": "inv1",
+        "grade": "Rich", "model_net_apy": 0.3, "vol_ratio": 0.2, "tvl": 50000,
+        "pair_mode": "stablecoin", "verdict": scan.VERDICT_ENTER,
+    }
+    unscoreable = [{"pool": f"X{i}-USDT", "reason": "investment-info fetch failed (network error)"}
+                   for i in range(5)]
+    monkeypatch.setattr(scan, "run_scan",
+                         lambda **kw: ([ok_result], [], unscoreable, FAKE_FULL_COVERAGE))
+
+    args = cli.build_parser().parse_args(["recommend"])
+    cli.cmd_recommend(args)
+
+    out = capsys.readouterr().out
+    assert "NO_TRADE" in out
+    assert "5/6" in out
+
+
+def test_recommend_does_not_mask_position_fetch_failure_as_no_positions(monkeypatch, capsys):
+    top_result = {
+        "pool": "NVDAB-USDT", "stock_ticker": "NVDA", "investmentId": "inv1",
+        "grade": "Rich", "model_net_apy": 0.3, "vol_ratio": 0.2, "tvl": 50000,
+        "pair_mode": "stablecoin", "best_range": {"pb": None, "confidence": "High", "model_net_apy": 0.3},
+        "verdict": scan.VERDICT_ENTER,
+    }
+    monkeypatch.setattr(scan, "run_scan", lambda **kw: ([top_result], [], [], FAKE_FULL_COVERAGE))
+
+    def boom():
+        raise RuntimeError("session expired")
+    monkeypatch.setattr(market_data, "fetch_positions", boom)
+
+    args = cli.build_parser().parse_args(["recommend"])
+    cli.cmd_recommend(args)
+
+    out = capsys.readouterr().out
+    assert "Could not check your current bStock LP positions" in out
+    assert "session expired" in out
+    assert "No current bStock LP positions" not in out
+
+
+def test_recommend_table_and_capital_estimate_use_the_same_net_apy_as_the_headline(monkeypatch, capsys):
+    # Real bug, confirmed live: the headline sentence quoted best_range.model_net_apy (845.3%)
+    # for a pool while the table right below it and the $/yr estimate both used the plain
+    # (full-range) model_net_apy (593.97%) for that identical row -- same pool, two different
+    # numbers, nothing distinguishing them. Locks in that all three now agree.
+    top_result = {
+        "pool": "GMEB-USDT", "stock_ticker": "GME", "investmentId": "inv1",
+        "grade": "Rich", "model_net_apy": 0.30, "vol_ratio": 0.06, "tvl": 250000,
+        "pair_mode": "stablecoin", "verdict": scan.VERDICT_ENTER,
+        "best_range": {"pb": 1.5, "confidence": "Moderate", "model_net_apy": 0.845},
+    }
+    monkeypatch.setattr(scan, "run_scan", lambda **kw: ([top_result], [], [], FAKE_FULL_COVERAGE))
+    monkeypatch.setattr(market_data, "fetch_positions", lambda: {"success": True, "data": {"list": []}})
+
+    args = cli.build_parser().parse_args(["recommend", "--capital", "10000"])
+    cli.cmd_recommend(args)
+
+    out = capsys.readouterr().out
+    assert "84.5% net APY" in out          # headline: best_range's number
+    assert "84.50%" in out                 # table: same number, not 30.00%
+    assert "30.00%" not in out             # the full-range number must not leak into either
+    assert "$8,450/yr" in out              # capital estimate: 10000 * 0.845, not 10000 * 0.30
+
+
+def test_scan_with_range_capital_estimate_uses_range_net_not_full_range(monkeypatch, capsys):
+    # Same class of bug as cmd_recommend above, in `scan --with-range --capital`: the table's
+    # range-net column is per-row best_range.model_net_apy, so the $/yr estimate below it must
+    # use the same number for the top pick, not the plain full-range model_net_apy.
+    top_result = {
+        "pool": "GMEB-USDT", "stock_ticker": "GME", "investmentId": "inv1", "protocol": "PancakeSwap V3",
+        "grade": "Rich", "model_net_apy": 0.30, "apy": 0.35, "sigma_annual": 0.4, "vol_ratio": 0.06,
+        "tvl": 250000, "pair_mode": "stablecoin", "verdict": scan.VERDICT_ENTER,
+        "best_range": {"pb": 1.5, "confidence": "Moderate", "model_net_apy": 0.845},
+    }
+    monkeypatch.setattr(scan, "run_scan", lambda **kw: ([top_result], [], [], FAKE_FULL_COVERAGE))
+
+    args = cli.build_parser().parse_args(["scan", "--with-range", "--capital", "10000"])
+    cli.cmd_scan(args)
+
+    out = capsys.readouterr().out
+    assert "84.50%" in out                 # range-net column: best_range's number
+    assert "$8,450/yr" in out              # capital estimate must match, not $3,000/yr (30%)
+    assert "$3,000/yr" not in out
+
+
+# ---- rebalance-check: multi-investmentId worst-case, best_alternative + switching ----
+
+def test_rebalance_check_evaluates_every_investment_id_worst_case(monkeypatch, capsys):
+    def fake_fetch_positions():
+        return {"deFiProtocolVOList": [{
+            "protocolName": "PancakeSwap V3", "binanceChainId": "56",
+            "poolList": [{"poolType": "Liquidity Pool", "positionCollectionList": [{"positionList": [{
+                "investmentIds": ["good", "bad"],
+                "positionDetail": {"nftId": "n1"},
+                "tokenList": {"supply": [{"tokenAddress": nvda_token()["contractAddress"],
+                                           "tokenAmount": "1", "tokenValue": "100"}]},
+            }]}]}],
+        }]}
+    monkeypatch.setattr(market_data, "fetch_positions", fake_fetch_positions)
+    monkeypatch.setattr(market_data, "fetch_stock_tokens", lambda type_filter=None: [nvda_token()])
+
+    def fake_run_scan(**kwargs):
+        market_results = [{"investmentId": "good", "stock_ticker": "NVDA", "vol_ratio": 0.3,
+                            "apy": 0.4, "model_net_apy": 0.35}]
+        return market_results, [], [], FAKE_FULL_COVERAGE
+    monkeypatch.setattr(scan, "run_scan", fake_run_scan)
+
+    def fake_fetch_investment_info(inv_id):
+        raise RuntimeError("pool not found")
+    monkeypatch.setattr(market_data, "fetch_investment_info", fake_fetch_investment_info)
+
+    args = cli.build_parser().parse_args(["rebalance-check", "--json"])
+    cli.cmd_rebalance_check(args)
+
+    data = json.loads(capsys.readouterr().out)
+    pos = data["positions"][0]
+    ids_by_id = {r["investmentId"]: r for r in pos["investment_ids"]}
+    assert ids_by_id["good"]["vol_ratio"] == 0.3
+    assert ids_by_id["bad"]["evaluated"] is False
+    assert pos["unevaluated_count"] == 1
+    assert pos["needs_attention"] is True
+    assert data["dyor_disclaimer"] == config.DYOR_DISCLAIMER
+
+
+def test_rebalance_check_names_best_alternative_and_switch_verdict(monkeypatch, capsys):
+    def fake_fetch_positions():
+        return {"deFiProtocolVOList": [{
+            "protocolName": "PancakeSwap V3", "binanceChainId": "56",
+            "poolList": [{"poolType": "Liquidity Pool", "positionCollectionList": [{"positionList": [{
+                "investmentIds": ["held1"],
+                "positionDetail": {"nftId": "n1"},
+                "tokenList": {"supply": [{"tokenAddress": nvda_token()["contractAddress"],
+                                           "tokenAmount": "100", "tokenValue": "20000"}]},
+            }]}]}],
+        }]}
+    monkeypatch.setattr(market_data, "fetch_positions", fake_fetch_positions)
+    monkeypatch.setattr(market_data, "fetch_stock_tokens", lambda type_filter=None: [nvda_token()])
+
+    def fake_run_scan(**kwargs):
+        market_results = [
+            {"investmentId": "held1", "stock_ticker": "NVDA", "vol_ratio": 0.9, "apy": 0.10,
+             "model_net_apy": 0.03, "pool": "NVDAB-USDT (held)", "protocol": "PancakeSwap V3",
+             "tvl": 20000, "pair_mode": "stablecoin", "grade": "Fair"},
+            {"investmentId": "alt1", "stock_ticker": "NVDA", "vol_ratio": 0.2, "apy": 0.40,
+             "model_net_apy": 0.35, "pool": "NVDAB-USDT (better)", "protocol": "Uniswap V3",
+             "tvl": 80000, "pair_mode": "stablecoin", "grade": "Rich"},
+        ]
+        return market_results, [], [], FAKE_FULL_COVERAGE
+    monkeypatch.setattr(scan, "run_scan", fake_run_scan)
+
+    args = cli.build_parser().parse_args(["rebalance-check", "--json"])
+    cli.cmd_rebalance_check(args)
+
+    data = json.loads(capsys.readouterr().out)
+    pos = data["positions"][0]
+    assert pos["best_alternative"]["investmentId"] == "alt1"
+    assert pos["switching"]["verdict"] == "switch"
+    assert pos["needs_attention"] is True
+
+
+def test_rebalance_check_carries_model_apy_caveat_text_and_json(monkeypatch, capsys):
+    # Confirmed live: every other command that shows a model_net_apy-derived number prints
+    # MODEL_APY_CAVEAT alongside DYOR_DISCLAIMER -- rebalance-check used to print only the
+    # latter, in both text and JSON, despite showing held/alternative apy and a dollar
+    # switching-cost estimate. A held position is required here -- an empty positions list
+    # early-returns before ever reaching the caveat-printing code at the end.
+    def fake_fetch_positions():
+        return {"deFiProtocolVOList": [{
+            "protocolName": "PancakeSwap V3", "binanceChainId": "56",
+            "poolList": [{"poolType": "Liquidity Pool", "positionCollectionList": [{"positionList": [{
+                "investmentIds": ["held1"],
+                "positionDetail": {"nftId": "n1"},
+                "tokenList": {"supply": [{"tokenAddress": nvda_token()["contractAddress"],
+                                           "tokenAmount": "100", "tokenValue": "20000"}]},
+            }]}]}],
+        }]}
+    monkeypatch.setattr(market_data, "fetch_positions", fake_fetch_positions)
+    monkeypatch.setattr(market_data, "fetch_stock_tokens", lambda type_filter=None: [nvda_token()])
+    market_results = [{"investmentId": "held1", "stock_ticker": "NVDA", "vol_ratio": 0.9, "apy": 0.10,
+                        "model_net_apy": 0.03, "pool": "NVDAB-USDT", "protocol": "PancakeSwap V3",
+                        "tvl": 20000, "pair_mode": "stablecoin", "grade": "Fair"}]
+    monkeypatch.setattr(scan, "run_scan", lambda **kw: (market_results, [], [], FAKE_FULL_COVERAGE))
+
+    args = cli.build_parser().parse_args(["rebalance-check"])
+    cli.cmd_rebalance_check(args)
+    out = capsys.readouterr().out
+    assert "model estimate" in out  # MODEL_APY_CAVEAT's own leading phrase
+    assert "Always DYOR" in out
+
+    args_json = cli.build_parser().parse_args(["rebalance-check", "--json"])
+    cli.cmd_rebalance_check(args_json)
+    data = json.loads(capsys.readouterr().out)
+    assert "model_apy_caveat" in data
+    assert "dyor_disclaimer" in data
+
+
+# ---- property-style checks (randomized, no hypothesis dependency) ----
+
+def test_no_exit_probability_stays_in_unit_interval_property():
+    import random
+    rng = random.Random(42)
+    for _ in range(200):
+        pa = rng.uniform(0.5, 0.99)
+        pb = rng.uniform(1.01, 2.0)
+        sigma = rng.uniform(0.05, 3.0)
+        years = rng.uniform(0.1, 3.0)
+        result = range_model.no_exit_probability(pa, pb, sigma, years)
+        assert 0.0 <= result <= 1.0, f"out of range for pa={pa} pb={pb} sigma={sigma} years={years}"
+
+
+def test_switching_recommendation_verdict_matches_gap_sign_property():
+    import random
+    rng = random.Random(7)
+    for _ in range(200):
+        position_usd = rng.uniform(1, 200_000)
+        held = rng.uniform(-0.5, 1.0)
+        alt = rng.uniform(-0.5, 1.0)
+        result = cli._switching_recommendation(position_usd, held, alt)
+        gap = position_usd * (alt - held)
+        if gap <= 0:
+            assert result["verdict"] == "stay"
+        assert result["annual_gap_usd"] == pytest.approx(gap)
