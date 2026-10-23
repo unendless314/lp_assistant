@@ -9,9 +9,9 @@
 ## 結論摘要
 
 1. 原專案的池子資料全部來自 `baw`（Binance Agentic Wallet CLI），**必須登入錢包 session**，不適合放在伺服器上。
-2. 改用公開 API 可以涵蓋 **BSC 與 Solana**，不需要 baw。
-3. 主要缺口：BSC 沒有現成 APY、沒有歷史 TVL、抓不到挖礦獎勵 APY。
-4. Robinhood Chain 尚未調查。
+2. 改用公開 API 可以涵蓋 **BSC、Solana 與 Robinhood Chain**，不需要 baw。
+3. 主要缺口：BSC 與 Robinhood 沒有現成 APY、沒有歷史 TVL、抓不到挖礦獎勵 APY。
+4. Robinhood Chain 有**官方公開的股票代幣清單**（含 ISIN），可用來核對地址、排除第三方代幣；約一半的股票池是 Uniswap V4（見 §7）。
 
 ---
 
@@ -92,8 +92,43 @@ Solana（DefiLlama）：
 - **仿冒代幣**：搜尋「牛来」出現多個不同地址的同名代幣（`NiuLai`、`NIULAI`），交易量趨近於零；真正的牛来主要池子都指向 `0xbeea1d618e533a387d941f58a7d4c9b7bd377777`。搜尋「幣安人生」只找到交易量為 0 的小池，疑似仿冒，未能確認正確地址。
 - **股票 × 迷因幣的大池**：`QQQB/牛来`（PancakeSwap V2）TVL 約 113 萬。
 
-## 7. 尚未調查
+## 7. Robinhood Chain（Chain ID 4663）
 
-- Robinhood Chain 是否被 GeckoTerminal / DefiLlama 收錄
-- 幣安 K 線 API 是否收錄迷因幣
+### 代幣清單：官方公開 API
+
+- `GET https://api.robinhood.com/rhj/assets`，免登入。實測 **195 檔**，全部部署在 4663、狀態皆為 `ASSET_STATUS_ACTIVE`。
+- 每檔欄位：`tokenSymbol`、`deployments[].contractAddress`、`currentMultiplier` / `pendingMultiplier`（分割、配息調整）、**`isin`**、`tradingCapabilities`（各交易時段是否可交易）、`tokenDecimals`（18）。
+- 抽查 GeckoTerminal 上 7 檔股票池的代幣地址（NVDA、SPY、CRCL、MSTR、SPCX、QQQ、USO），**全部與官方清單一致**；第三方整理（[SQD](https://sqd.dev/learn/robinhood-tokenized-stocks/)）的 NVDA、SPY 地址也一致。
+- 不在官方清單的代幣可視為第三方發行。例：`AAPLx3L`（3 倍槓桿 AAPL，TVL 約 1,057 萬）不在清單中。
+- 官方文件（[docs.robinhood.com/chain/stock-tokens](https://docs.robinhood.com/chain/stock-tokens/)）：鑄造/贖回時段為週一 02:00 至週六 02:00（CET/CEST），鏈上交易 24/7 不受限。
+
+### 池子資料
+
+| 來源 | 涵蓋 | 說明 |
+|---|---|---|
+| GeckoTerminal | **有** | 網路 ID `robinhood`；收錄 50 個 DEX（Uniswap V2/V3/V4、PancakeSwap、Aerodrome、Ramses、Sushi 等） |
+| DefiLlama Yields | 無 LP 池 | 81 個池子幾乎都是借貸（Morpho、Spark、LayerBank），沒有 Uniswap 等 DEX |
+| RPC `rpc.mainnet.chain.robinhood.com` | 可連線 | `eth_chainId` 回傳 `0x1237`（4663） |
+
+依 24h 交易量排序的前 60 個池子中，含官方股票代幣的有 16 個：Uniswap V3 7 個、**Uniswap V4 7 個**、Aerodrome 1 個、Ramses 1 個。主要股票池：
+
+| 池子 | TVL | 24h 交易量 |
+|---|---|---|
+| Uniswap V3 `NVDA/USDG 0.05%` | 301 萬 | 527 萬 |
+| Uniswap V3 `CRCL/USDG 0.3%` | 287 萬 | 454 萬 |
+| Uniswap V3 `USO/USDG 0.3%` | 204 萬 | 154 萬 |
+| Uniswap V3 `SPY/WETH 0.05%` | 197 萬 | 305 萬 |
+| Uniswap V4 `MSTR/USDG 0.25%` | 170 萬 | 169 萬 |
+| Uniswap V4 `SPY/NVDA 0.025%` | 166 萬 | 236 萬 |
+
+- 隨機抽 12 檔官方股票，每檔都有池子；冷門股最大池 TVL 僅數千美元（如 SLS 4,383、IBRX 5,146）。
+- **歷史資料**：`NVDA/USDG 0.05%` 的 `ohlcv/day` 回傳 60 天日線，與 BSC 相同。
+- **V4 池**：GeckoTerminal 不顯示池子掛載的 hook。部分 V4 池名稱沒有費率（例如 `SPCX / USDG`），疑為動態費率，無法用公式估算 APY。
+- **主要報價幣 USDG**（Paxos Global Dollar），GeckoTerminal 上地址為 `0x5fc5360d0400a0fd4f2af552add042d716f1d168`，**尚未與 Paxos 官方核對**。
+
+## 8. 尚未調查
+
+- 幣安 K 線 API 是否收錄迷因幣、是否收錄 Robinhood Chain
 - 公式估算的 APY 與幣安錢包顯示值的差距
+- Uniswap V4 池的 hook 能否從鏈上讀取（PoolManager 合約）
+- USDG 合約地址的官方核對
