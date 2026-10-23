@@ -1,0 +1,99 @@
+# 資料來源可行性調查
+
+> 調查日期：2026-10-23。外部 API 隨時可能改版、改限額，引用前請確認日期。
+
+## 目的
+
+確認「不登入任何錢包」的前提下，能不能取得代幣化股票 LP 池子的 APY、TVL、交易量、費率階梯。
+
+## 結論摘要
+
+1. 原專案的池子資料全部來自 `baw`（Binance Agentic Wallet CLI），**必須登入錢包 session**，不適合放在伺服器上。
+2. 改用公開 API 可以涵蓋 **BSC 與 Solana**，不需要 baw。
+3. 主要缺口：BSC 沒有現成 APY、沒有歷史 TVL、抓不到挖礦獎勵 APY。
+4. Robinhood Chain 尚未調查。
+
+---
+
+## 1. 原專案（reference）的資料來源
+
+依原專案 `SKILL.md` 的資料來源表：
+
+| 資料 | 來源 | 需登入 |
+|---|---|---|
+| 股票代幣清單 | 幣安公開 API `bapi/defi/.../rwa/stock/detail/list/ai` | 否 |
+| K 線 | 幣安公開 API `bapi/defi/.../dex/market/token/kline/ai` | 否 |
+| LP 池子 APY / TVL | `baw defi investment-list` | **是** |
+| 池子組成、V3 費率 | `baw defi investment-info` | **是** |
+| 持有部位 | `baw defi position` | **是** |
+
+baw 的風險：
+- 登入後的 session 能執行存入/提領等操作，放在伺服器上等於常駐一個能動用錢包的憑證。
+- session 會過期（`SESSION_EXPIRED`），重新登入需人工驗證，無法無人值守。
+- 每次呼叫要啟動一個 Node CLI 子程序（原專案註解記載約 0.6 秒以上）。
+- 本次調查沒有安裝 baw，以上依原專案文件判斷，未實測。
+
+## 2. 幣安股票代幣清單
+
+| `type` | 發行商 | 筆數 | 鏈分布 |
+|---|---|---|---|
+| 3 | bStock（`...B`） | 100 | 全在 BSC |
+| 2 | xStocks（`...x`） | 269 | **Solana 139、BSC 130** |
+
+- 規劃書寫的「269 檔 Solana xStocks」不正確，xStocks 同時發行在兩條鏈上。
+- 因此 BSC 上同一檔股票可能同時有 bStock 和 xStocks 兩種代幣（例如 `TSLAB` 與 `TSLAx`）。
+- 每筆資料有 `multiplier` 欄位（例如 `1.0072`），表示 1 顆代幣對應的股數，跨發行商比價時要考慮。
+
+## 3. 公開 API 涵蓋情況
+
+樣本：TSLA、NVDA、AAPL、MU、COIN、SPY、QQQ、MSTR、GOOGL、CRCL，共 10 檔。
+
+| 來源 | BSC bStock | Solana xStocks | BSC xStocks | 提供的欄位 |
+|---|---|---|---|---|
+| GeckoTerminal | 10/10 | 10/10 | 10/10（池子少） | TVL、24h 交易量；費率寫在池名（`TSLAB / USDT 0.25%`） |
+| DexScreener | 10/10 | 9/10（MUx 僅 2 池） | 1/10 | TVL、交易量；無費率 |
+| DefiLlama Yields | 部分（漏 PancakeSwap V3） | 10/10 | 0/10 | `apyBase`、`apyMean30d`、`volumeUsd1d`、費率（`poolMeta`）；混有借貸池需過濾 |
+
+### 範例：TSLA
+
+BSC（GeckoTerminal）：
+
+| 池子 | TVL | 24h 交易量 |
+|---|---|---|
+| PancakeSwap V3 `TSLAB/USDT 0.25%` | 205 萬 | 197 萬 |
+| PancakeSwap V3 `TSLAB/USDT 1%` | 14 萬 | 6 萬 |
+| Uniswap `TSLAB/USDT 0.05%` | 5 萬 | 50 萬 |
+
+DefiLlama 對 TSLAB 只收錄了上表的 Uniswap 小池，**漏掉最大的 PancakeSwap V3 池**。
+
+Solana（DefiLlama）：
+
+| 池子 | TVL | APY | 30 天平均 APY |
+|---|---|---|---|
+| Raydium CLMM `TSLAx/USDC 0.1%` | 239 萬 | 28.7% | 25.1% |
+| Orca `TSLAx/USDC` | 10.6 萬 | 37.0% | 42.5% |
+
+## 4. 歷史資料
+
+- GeckoTerminal `networks/{net}/pools/{address}/ohlcv/day`：實測回傳 **60 天**日線，含收盤價與 USD 交易量。BSC 可回補 30 天 TWAP 所需的交易量。
+- **沒有歷史 TVL**：GeckoTerminal 只提供當下的 `reserve_in_usd`。歷史 TVL 必須自己定期存快照。
+
+## 5. 限額與批次
+
+- GeckoTerminal 免費額度約 30 次/分鐘，連續請求即觸發 HTTP 429。
+- 批次端點 `networks/{net}/pools/multi/{addresses}`：以 3 個池子實測成功。一次上限 30 個是依官方文件的記憶，**未實測**。
+- 代幣總數約 370（bStock 100 + xStocks 269），逐一查詢池子清單約需 13 分鐘。
+
+## 6. 資料品質觀察
+
+- **APY 算法不一致**：GeckoTerminal 不提供 APY，DefiLlama 有自己的算法。自行以 `24h 交易量 × 費率 ÷ TVL × 365` 估算時，對 CLMM 池是粗估（手續費只分給區間內流動性）。尚未與幣安錢包顯示的 APY 對照。
+- **挖礦獎勵 APY**（例如 CAKE 獎勵）在公開來源中基本抓不到。
+- **迷因幣配對很多**：例如 `TeslaSI/TSLAB`（TVL 18 萬、24h 交易量 49 萬）、`Roadster/TSLAB`。
+- **仿冒代幣**：搜尋「牛来」出現多個不同地址的同名代幣（`NiuLai`、`NIULAI`），交易量趨近於零；真正的牛来主要池子都指向 `0xbeea1d618e533a387d941f58a7d4c9b7bd377777`。搜尋「幣安人生」只找到交易量為 0 的小池，疑似仿冒，未能確認正確地址。
+- **股票 × 迷因幣的大池**：`QQQB/牛来`（PancakeSwap V2）TVL 約 113 萬。
+
+## 7. 尚未調查
+
+- Robinhood Chain 是否被 GeckoTerminal / DefiLlama 收錄
+- 幣安 K 線 API 是否收錄迷因幣
+- 公式估算的 APY 與幣安錢包顯示值的差距
