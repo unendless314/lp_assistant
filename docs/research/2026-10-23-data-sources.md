@@ -124,11 +124,10 @@ Solana（DefiLlama）：
 - 隨機抽 12 檔官方股票，每檔都有池子；冷門股最大池 TVL 僅數千美元（如 SLS 4,383、IBRX 5,146）。
 - **歷史資料**：`NVDA/USDG 0.05%` 的 `ohlcv/day` 回傳 60 天日線，與 BSC 相同。
 - **V4 池**：GeckoTerminal 不顯示池子掛載的 hook。部分 V4 池名稱沒有費率（例如 `SPCX / USDG`），疑為動態費率，無法用公式估算 APY。
-- **主要報價幣 USDG**（Paxos Global Dollar），GeckoTerminal 上地址為 `0x5fc5360d0400a0fd4f2af552add042d716f1d168`，**尚未與 Paxos 官方核對**。
+- **主要報價幣 USDG**（Paxos Global Dollar）：Robinhood Chain 代幣地址 `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`，**已與 [Paxos 官方文件](https://docs.paxos.com/guides/stablecoin/usdg/mainnet)核對一致**（同頁的 `0x0d54…28d1` 是 OFT 跨鏈合約，不是代幣本身）。Solana 版 USDG 代幣地址為 `2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH`；文件未列 BNB Chain 版本。
 
 ## 8. 尚未調查
 
 - 幣安 K 線 API 是否收錄迷因幣、是否收錄 Robinhood Chain
 - 公式估算的 APY 與幣安錢包顯示值的差距
 - Uniswap V4 池的 hook 能否從鏈上讀取（PoolManager 合約）
-- USDG 合約地址的官方核對
