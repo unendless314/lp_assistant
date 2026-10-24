@@ -2,6 +2,13 @@
 
 > ⚠️ **尚未採用**。這份是討論初期過早寫下的草稿，僅供日後撰寫正式架構文件時參考。
 > 需求以 [`prd.md`](prd.md) 為準，資料來源實測以 [`research/2026-10-23-data-sources.md`](research/2026-10-23-data-sources.md) 為準。日期：2026-10-23
+>
+> **已知與 PRD（2026-10-24 修訂）衝突之處**，撰寫正式架構文件時以 PRD 為準：
+> - §0「Solana 以 DefiLlama 為主」：已改為三條鏈都自算 APY，DefiLlama 只做對照（PRD §6）。
+> - §0、目錄結構中的「幣安 K 線」：波動率已改用 yfinance 美股日 K 線（PRD F2）。
+> - §2 的 APY 公式 `volume × fee_tier ÷ tvl × 365`：已改為全區間 LP 收益，分母用鏈上 L 換算，費率用 LP 實得費率並從鏈上讀取（PRD F2）。架構需新增鏈上 RPC 讀取（EVM 合約、Solana 帳戶）。
+> - `apy.py` 的 TWAP/EWMA、APY 波動度折價：已改為 7 天日 APY 中位數，不做折價（PRD F2）。
+> - §6 待確認事項中的 Robinhood Chain 資料來源、跨發行商價差：已於 PRD 定案。
 
 ---
 
