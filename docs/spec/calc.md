@@ -117,7 +117,7 @@
 
 - **CALC-AGG-1** `apy_7d` = 最近 7 個 UTC 日（CALC-DAY-3）的 `daily_apy` 中位數。窗口內每一天都必須有 `daily_apy`（實測或近似皆可），否則不計算：缺日是因為歷史不足時為「資料不足」，因為分母為零（CALC-APY-8）時為「無法計算」。
 - **CALC-AGG-2** `apy_30d` = 最近 30 個 UTC 日的 `daily_apy` 中位數（偶數個時取中間兩個的平均）。窗口內有任何一天沒有 `daily_apy` 時為缺值，顯示「—」（F2-AC10）。
-- **CALC-AGG-3** `history_days` = 池子從外部日線的第一個日期到 `volume_synced_through`（CALC-DAY-4）的天數（含回補）。日線中間缺少的日期視為交易量 0（外部日線對沒有成交的日子不回傳 K 線，見 SRC-GT-4）。`history_days < MIN_HISTORY_DAYS` 為「資料不足」，此時 `apy_7d` 與其衍生值（淨收益、損耗比、容錯空間、池子平均 APY）都不計算，不以不足 7 天的資料硬算。
+- **CALC-AGG-3** 每日交易量分為**已知**（`pool_daily_volume` 有資料列，含明確的 0）與**未知**（沒有資料列，SRC-GT-4）。未知的日子沒有 `daily_apy`，不得當成交易量 0。`history_days` = 截至 `volume_synced_through`（CALC-DAY-4，含）往回、交易量連續已知的天數（含回補）；更早的日子若隔著未知的缺口，不計入。因此 7 天與 30 天窗口只要落在 `history_days` 內就不會含有未知的日子。`history_days < MIN_HISTORY_DAYS` 為「資料不足」，此時 `apy_7d` 與其衍生值（淨收益、損耗比、容錯空間、池子平均 APY）都不計算，不以不足 7 天的資料硬算。
 - **CALC-AGG-4** **近似標記 `≈`**：`apy_7d` 的窗口內有任何一天標記為近似（CALC-APY-4）時，`apy_7d` 帶近似標記；`apy_30d` 同理。由 `apy_7d` 衍生的淨收益、損耗比沿用 `apy_7d` 的標記（F2-AC11）。
 - **CALC-AGG-5** **趨勢箭頭**：`apy_30d` 有值且大於 0 時，令 `r = apy_7d ÷ apy_30d`；`r ≥ TREND_UP_RATIO` 為 ↑，`r ≤ TREND_DOWN_RATIO` 為 ↓，其餘不顯示（F6-AC9）。
 

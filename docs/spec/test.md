@@ -81,7 +81,7 @@
 | F2-AC7 | U、P | 使用鏈上費率；池名費率不同時寫入 `dev_log` |
 | F2-AC8 | U | 缺費率或 `lp_share` 為無法計算 |
 | F2-AC9 | U | 範例 E3；午夜後、昨日日線尚未同步時，窗口終點停在 `volume_synced_through`，`apy_7d` 不變且不把昨日當成 0（CALC-DAY-4） |
-| F2-AC10 | U | 歷史 29 天時 `apy_30d` 為空 |
+| F2-AC10 | U | 歷史 29 天時 `apy_30d` 為空；日線中斷超過 API 回補上限後恢復，缺口日為未知而非 0，`history_days` 從缺口後重新累計，窗口不含缺口日（CALC-AGG-3） |
 | F2-AC11 | U | 窗口含回補日帶近似標記；全為實測後標記消失 |
 | F2-AC12 | P、X | DefiLlama 數值不出現在輸出中；差距過大時寫入 `dev_log` |
 | F2-AC13 | U、P | `dex` 含 `v4`／`infinity` 或 32 位元組池子 ID 的池子不寫入資料庫 |

@@ -131,7 +131,7 @@
 | `pools` | `pool_id` | 池子靜態屬性 | 是 |
 | `pool_snapshots` | `(pool_id, ts)` | TVL、24h 交易量、兩個代幣美元價格、`fee_rate`、`lp_share`、L、√P、`complete` | **否，最重要的資產** |
 | `pool_snapshots_daily` | `(pool_id, day)` | 超過 90 天後彙整的每日資料（DATA-STORE-3） | 否 |
-| `pool_daily_volume` | `(pool_id, day)` | 外部日線的交易量 | 部分：只能回補約 60 天 |
+| `pool_daily_volume` | `(pool_id, day)` | 外部日線的交易量；抓取涵蓋範圍內沒有成交的日子存明確的 0，沒有資料列表示未知（SRC-GT-4、CALC-AGG-3） | 部分：只能回補約 60 天 |
 | `price_bars` | `(series, date)` | 股價與報價資產日 K 線 | 是 |
 | `sigmas` | `series_key` | 最新 σ、樣本數、最後成功計算時間 | 是 |
 | `runs` | 自增 | 每次排程工作的開始、結束、結果、各來源結果（NFR-AC10） | 否 |

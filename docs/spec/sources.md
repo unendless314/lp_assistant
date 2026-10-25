@@ -75,8 +75,8 @@
 - **SRC-GT-1** 基底網址 `https://api.geckoterminal.com/api/v2`。網路 ID：`bsc`、`solana`、`robinhood`。免費額度約 30 次/分鐘，限速設定為每分鐘 25 次以保留餘裕。
 - **SRC-GT-2** **找池子**：`GET /networks/{net}/tokens/{address}/pools?page={n}`。每個池子取：池子地址、`dex` ID、`name`（含池名費率，只用於比對）、base／quote 代幣地址、`pool_created_at`。
 - **SRC-GT-3** **快照**：`GET /networks/{net}/pools/multi/{addr1,addr2,...}`，每次最多 30 個地址（官方文件值；上限實作時實測，不足時縮小批次）。取 `reserve_in_usd`（TVL）、`volume_usd.h24`、`base_token_price_usd`、`quote_token_price_usd`，以及 `relationships.base_token`、`relationships.quote_token` 的代幣地址，供上層依地址對應到 token0／token1（CALC-APY-3）。
-- **SRC-GT-4** **日線**：`GET /networks/{net}/pools/{address}/ohlcv/day?limit={n}&currency=usd`，每筆含 UTC 日期與美元交易量，最多回傳約 60 天。沒有成交的日子不回傳 K 線，上層視為交易量 0（CALC-AGG-3）。**實作時確認**：日線的日期是否為 UTC 00:00 起算。
-- **SRC-GT-5** 回補：新池子第一次被發現時，抓取日線 `limit=60`。之後的例行抓取（`daily_close`）涵蓋 `volume_synced_through − 2` 到昨日，至少 3 天，以吸收資料源的延遲修正與先前的失敗。成功取得、且抓取時間晚於某日結束時，該日以前即視為已同步，更新 `volume_synced_through`（CALC-DAY-4）。
+- **SRC-GT-4** **日線**：`GET /networks/{net}/pools/{address}/ohlcv/day?limit={n}&currency=usd`，每筆含 UTC 日期與美元交易量，最多回傳約 60 天（實際上限實作時實測）。沒有成交的日子不回傳 K 線。一次成功抓取的**涵蓋範圍**為「請求範圍與 API 回補上限的交集」；涵蓋範圍內沒有 K 線的日子，寫入交易量為 0 的明確資料列（[`data-model.md`](data-model.md) `pool_daily_volume`）。涵蓋範圍以外的日子不寫入任何列，視為「未知」，不得當成 0（CALC-AGG-3）。**實作時確認**：日線的日期是否為 UTC 00:00 起算。
+- **SRC-GT-5** 回補：新池子第一次被發現時，抓取日線 `limit=60`；涵蓋範圍從回應中第一根 K 線的日期起算（更早的日子是池子歷史開始之前，不寫入）。之後的例行抓取（`daily_close`）請求 `volume_synced_through − 2` 到昨日，至少 3 天，以吸收資料源的延遲修正與先前的失敗。成功取得後，`volume_synced_through` 推進到涵蓋範圍的最後一日（CALC-DAY-4）。請求範圍超過 API 回補上限時（日線連續失敗超過約 60 天），舊水位與涵蓋範圍之間的日子沒有資料列，保留為「未知」缺口並寫入開發者紀錄；水位仍推進，讓池子恢復新鮮度，缺口由 CALC-AGG-3 排除在窗口之外。
 - **SRC-GT-6** GeckoTerminal 沒有歷史 TVL、沒有 APY、沒有 L；這些由本系統的快照與鏈上讀取補上。
 - **SRC-GT-7** 完整性檢查：TVL、交易量、兩個代幣價格皆存在且可解析為非負數字；否則該池子這次快照不完整（CALC-STATE-3）。
 
