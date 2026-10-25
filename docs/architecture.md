@@ -182,8 +182,8 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 - 每次工作寫入 `runs` 資料表：開始、結束、結果、各來源的成功／失敗筆數（NFR-AC10）。
 - 業務層面需要開發者注意的事件寫入 `dev_log`（[`data-model.md`](spec/data-model.md) §4.1），例如費率不符、對照差距、歸屬無法判斷、新命中的槓桿關鍵字。
 - 程式日誌輸出到 stdout，JSON Lines 格式，由 systemd journal 保存。
-- CLI 查詢：`lpa report runs`、`lpa report devlog`、`lpa report registry`。
-- 不另外架設監控服務；開發者以 CLI 與網頁上的中斷橫幅察覺問題。通知屬於第二版（PRD §9）。
+- CLI 查詢：`lpa report runs`、`lpa report devlog`、`lpa report registry`。預設輸出給人看的表格；加 `--json` 輸出機器可讀格式，契約見 [`data-model.md`](spec/data-model.md) §7。查詢指令一律以唯讀模式開啟資料庫，與排程程序同時執行時不影響寫入（WAL 允許一個寫入者與多個讀取者並行）。
+- 不另外架設監控服務；開發者以 CLI 與網頁上的中斷橫幅察覺問題。通知不由本系統推送，見 §10「同機 agent 存取」。
 
 ---
 
@@ -194,13 +194,19 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 - **部署方式**：`git pull` 後執行部署腳本（後端 `uv sync`、資料庫遷移、前端建置、重啟 systemd 服務）。
 - **備份**：每日備份上傳到 Cloudflare R2 的專用 bucket（憑證只能寫入該 bucket）。每月以腳本還原最新備份並跑 `PRAGMA integrity_check` 與筆數比對（NFR-AC11）。
 - **資料庫遷移**：schema 版本存在資料庫中，程式啟動時依序套用未執行的遷移腳本；遷移前自動備份。
+- **同機 agent（選用）**：若在同一台 VPS 上執行 agent 框架（§10），它以獨立的系統帳號與獨立的 systemd 服務執行，與排程程序互不依賴：agent 停止或出錯不影響排程與網頁，排程也不等待 agent。
 
 ---
 
 ## 8. 安全
 
 - 伺服器不存放私鑰、助記詞或錢包憑證；沒有任何交易功能（NFR-AC1）。
-- 唯一的憑證：可能使用的付費 RPC 金鑰（放 `.env`），以及 R2 備份憑證（限定單一 bucket、只能寫入）。
+- 本系統唯一的憑證：可能使用的付費 RPC 金鑰（放 `.env`），以及 R2 備份憑證（限定單一 bucket、只能寫入）。
+- **同機 agent 的權限邊界**：agent 會讀到外部資料（例如官方清單中的代幣名稱），也會收到通訊軟體上的訊息，兩者都可能夾帶誘導它執行指令的內容，因此以系統帳號權限作為最後防線：
+  - 可讀：`site/data/latest.json`；可執行 CLI 的查詢指令（§6，唯讀）。
+  - 不可寫：`data/`、`config/`、程式碼目錄；不可讀：專案的 `.env`。
+  - agent 自己的 LLM 金鑰與通訊軟體 bot token 放在 agent 帳號下，不放進本專案的 `.env`；它們不是錢包憑證，不違反 NFR-AC1。
+  - 寫入能力（例如修改 `devs_pick.yaml`）不在目前範圍；日後開放時只考慮低風險設定檔，並依賴 DATA-CFG-2 的驗證擋下格式錯誤。
 - 網頁沒有寫入端點（NFR-AC8），Caddy 只允許 `GET`、`HEAD`。
 - 依賴套件鎖定版本，CI 跑 `pip-audit` 與 `npm audit`。
 
@@ -228,7 +234,8 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 
 | 候選功能 | 承接方式 |
 |---|---|
-| 通知提醒 | 新增一個讀取匯出結果、比對門檻後推送的工作；不需要網頁寫入功能 |
+| 同機 agent 存取 | 同一台 VPS 上的 agent 框架（例如 Hermes Agent）透過本機介面讀取資料，再經由自己的 gateway 連到通訊軟體與使用者互動。本系統只提供本機資料介面：市場資料讀 `latest.json`，營運資料用 CLI `--json`（§6、[`data-model.md`](spec/data-model.md) §7）。不開網路 API，權限邊界見 §8 |
+| 通知提醒 | 由同機 agent 實現：定期讀取 `latest.json`（資料每 30 分鐘更新，讀取頻率不需更高）、比對門檻後以 agent 自己的通訊管道推送。本系統不新增推送工作，也不需要網頁寫入功能；使用者的持倉等個人資料留在 agent 端 |
 | 淨收益歷史走勢、長期穩定度 | `pool_snapshots` 與 `pool_snapshots_daily` 已永久保存；匯出另一個按需載入的歷史檔 |
 | 跨發行商比價 | `engine` 新增計算；`sources` 已有代幣價格 |
 | 非美股 | DATA-REG-8 的交易所清單改為設定；`prices` 支援非美股代號 |

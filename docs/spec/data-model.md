@@ -5,7 +5,7 @@
 
 ## 0. 範圍與邊界
 
-**本文件管**：系統內部的資料怎麼組織——資產登記表與其狀態機、股票與池子的歸屬規則、資料庫結構與保存策略、設定檔，以及後端輸出給前端的 JSON 格式。
+**本文件管**：系統內部的資料怎麼組織——資產登記表與其狀態機、股票與池子的歸屬規則、資料庫結構與保存策略、設定檔，以及對外的輸出格式（給前端的 JSON、CLI 的 JSON 輸出）。
 
 **本文件不管**：外部資料怎麼抓（[`sources.md`](sources.md)）；數字怎麼算、狀態怎麼判定（[`calc.md`](calc.md)）；畫面（[`ui.md`](ui.md)）。
 
@@ -246,3 +246,14 @@
 - **DATA-OUT-3** 「其他」級別的池子、低於 TVL 下限的池子、未啟用 DEX 的池子不輸出（F5-AC2、F2-AC3、F2-AC27）。
 - **DATA-OUT-4** 輸出中不得包含任何會讓瀏覽器呼叫外部資料 API 的網址（區塊瀏覽器與 DEX 頁面連結只在使用者點擊時開啟，不算）（NFR-AC2）。
 - **DATA-OUT-5** 同樣的資料庫內容與同樣的 `now`，產生的 JSON 位元組完全相同：物件鍵依字母排序，陣列依 CALC-RANK 規則或 `id` 排序（F6-AC23）。
+
+---
+
+## 7. CLI 的 JSON 輸出
+
+CLI 查詢指令（[`../architecture.md`](../architecture.md) §6）加上 `--json` 時的輸出。使用者是開發者的腳本與同機 agent（[`../architecture.md`](../architecture.md) §10），因此與 `latest.json` 一樣視為對外介面。
+
+- **DATA-CLI-1** 輸出一個 JSON 物件到 stdout，頂層含 `schema_version`（整數）、`generated_at`（UTC ISO 8601）與資料本體；錯誤訊息只寫到 stderr，並以非零結束碼結束，stdout 不混入非 JSON 內容。
+- **DATA-CLI-2** 欄位命名、狀態代碼與比率單位與 §6 相同（DATA-OUT-1、DATA-OUT-2），同一個概念不在兩種輸出中用不同名稱。
+- **DATA-CLI-3** 新增欄位不升版；刪除、改名或改變欄位意義時，`schema_version` 加一。`latest.json` 的 `schema_version` 採相同規則。
+- **DATA-CLI-4** 查詢指令只讀不寫：以唯讀模式開啟資料庫，不寫入任何資料表或檔案（包括 `runs` 與 `dev_log`）。
