@@ -208,8 +208,7 @@
   "pool_id": "bsc:0x...",
   "chain": "bsc", "dex": "pancakeswap-v3-bsc", "dex_name": "PancakeSwap V3", "kind": "clmm",
   "pool_url": "https://pancakeswap.finance/...",            // F6-AC10
-  "stock_ids": ["isin:US88160R1014"],                       // 股票配股票時有兩個
-  "sides": [                                                // 池子兩邊的代幣，順序同鏈上 token0、token1
+  "sides": [                                                // 池子兩邊的代幣，順序同鏈上 token0、token1；池子所屬的卡片由 sides[].stock_id 推導（股票配股票時有兩張）
     { "token_id": "bsc:0x...", "symbol": "TSLAB", "kind": "stock", "issuer": "bstock", "stock_id": "isin:US88160R1014" },
     { "token_id": "bsc:0x55d3...", "symbol": "USDT", "kind": "core", "issuer": null, "stock_id": null }
   ],
