@@ -79,7 +79,7 @@
 
 ## 3. 池子
 
-- **DATA-POOL-1** 池子的靜態屬性在第一次發現時寫入：`pool_id`、`chain`、`dex`、`kind`（`v2`／`clmm`）、`token0`、`token1`（含精度）、`name`、`created_at`、`discovered_at`。
+- **DATA-POOL-1** 池子的靜態屬性在第一次發現時寫入：`pool_id`、`chain`、`dex`、`kind`（`v2`／`clmm`）、`token0`、`token1`（含精度）、`name`、`created_at`、`discovered_at`。另有一個隨日線抓取更新的欄位 `volume_synced_through`（CALC-DAY-4、SRC-GT-5）。
 - **DATA-POOL-2** **報價資產分級**（F5）：池子兩邊的代幣依序判斷：
   1. 在登記表中且已收錄 → 股票代幣。
   2. 在**核心報價資產地址表**中 → 核心。
@@ -107,6 +107,13 @@
 - **DATA-POOL-4** 股票配股票的池子同時屬於兩張卡片，資料只存一份（F3-AC2）。
 - **DATA-POOL-5** V4／Infinity 池在寫入前就被排除（SRC-DEX-3），不存在於資料庫中，因此不可能出現在卡片、搜尋或交易量加總（F2-AC13）。
 - **DATA-POOL-6** **未啟用 DEX**：`dex` 不在 DEX 對照表中，或在表上但展示狀態為 `候選`（[`sources.md`](sources.md) SRC-DEX-4）的池子，照常寫入 `pools` 並收集快照（之後啟用時已有歷史資料），標記為 `dex_not_enabled`；每個 `dex` ID 第一次出現這種池子時寫入開發者紀錄（不在表上為 `UNLISTED_DEX`，候選為 `DEX_NOT_ENABLED`，含池子數）。這類池子不收錄，不輸出（F2-AC27）。V4 排除（DATA-POOL-5）先於此規則：V4 池連資料都不保存。
+- **DATA-POOL-7** **收集範圍**：
+  | 池子 | 靜態屬性 | 快照（`collect`） | 日線（`daily_close`） | 目的 |
+  |---|---|---|---|---|
+  | 報價資產分級可收錄（DATA-POOL-2），不論 DEX 是否啟用、TVL 是否高於下限 | 保存 | 每輪 | 每日 | 收錄判定需要日平均 TVL（CALC-INC-1），低於下限的池子回升時才能判斷；候選 DEX 啟用時已有歷史 |
+  | 「其他」級別 | 保存 | 不收集 | 不收集 | F5「保留資料」以靜態屬性滿足；分級改變（例如代幣加入登記表）時，下一輪起開始收集並依 SRC-GT-5 回補 60 天日線 |
+
+  資料源回報池子不存在時，池子停止收集並寫入開發者紀錄，資料保留。
 
 ---
 
@@ -135,7 +142,11 @@
 
 ### 4.2 保存與彙整
 
-- **DATA-STORE-3** `pool_snapshots` 保留最近 90 天的原始資料。更早的資料每日彙整成 `pool_snapshots_daily` 一筆：TVL 平均、最高、最低；當日交易量（取自 `pool_daily_volume`）；全區間等價資金平均（集中流動性池）；當日最後的 `fee_rate`、`lp_share`。彙整只使用 `complete` 的快照，與 CALC-APY-2、CALC-APY-3 同口徑，因此彙整前後算出的每日數值一致（NFR-AC5）。全區間等價資金平均是 PRD 列舉之外的必要欄位：沒有它就無法重算集中流動性池的歷史 APY。
+- **DATA-STORE-3** `pool_snapshots` 保留最近 90 天的原始資料。更早的日子，凡在 `pool_daily_volume` 有交易量或有完整快照者，每日彙整成 `pool_snapshots_daily` 一筆：
+  - **觀測值**：TVL 平均、最高、最低（只用當日 `complete` 快照；當日沒有完整快照時為空）；當日交易量（取自 `pool_daily_volume`）。
+  - **已決定的計算輸入**：`denom_usd`（CALC-APY-2／CALC-APY-3）、`tvl_denom_usd`（池子平均 APY 的分母，CALC-APY-7）、`fee_rate`、`lp_share`、`approx`。彙整時以 `engine` 中與每日 APY 相同的函式決定（含 CALC-APY-4 的近似回退），之後不再重新選取。
+
+  因此彙整前後算出的每日數值一致（NFR-AC5），回補日與斷線日也不例外。已決定的計算輸入是 PRD 列舉之外的必要欄位：只存觀測值時，集中流動性池與近似日的歷史 APY 都無法重算。
 - **DATA-STORE-4** 彙整在同一個交易中完成：先寫入 `pool_snapshots_daily`，驗證筆數，再刪除原始快照。
 - **DATA-STORE-5** 每日備份資料庫（SQLite online backup）到 VPS 以外的位置，保留最近 30 份每日備份與每月一份長期備份。備份檔須能以 `sqlite3` 開啟並通過 `PRAGMA integrity_check`（NFR-AC11）。
 - **DATA-STORE-6** 外部回應原始檔存於 `data/raw/{source}/{YYYY-MM-DD}/`，gzip，保留 30 天（SRC-ALL-4），不納入備份。
@@ -225,7 +236,7 @@
   "history_days": 45,
   "status": { "primary": null, "secondary": [] },           // 排除類狀態代碼
   "hints": ["delayed"],                                     // 提示類：delayed／anomaly／volatile
-  "last_complete_snapshot_at": "2026-10-26T12:00:00Z",
+  "last_complete_snapshot_at": "2026-10-26T12:00:00Z",      // 從未有完整快照時為 null
   "dev": { "reason_codes": [] }                             // F2-AC20；前端不顯示
 }
 ```

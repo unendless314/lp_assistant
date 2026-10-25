@@ -74,9 +74,9 @@
 
 - **SRC-GT-1** 基底網址 `https://api.geckoterminal.com/api/v2`。網路 ID：`bsc`、`solana`、`robinhood`。免費額度約 30 次/分鐘，限速設定為每分鐘 25 次以保留餘裕。
 - **SRC-GT-2** **找池子**：`GET /networks/{net}/tokens/{address}/pools?page={n}`。每個池子取：池子地址、`dex` ID、`name`（含池名費率，只用於比對）、base／quote 代幣地址、`pool_created_at`。
-- **SRC-GT-3** **快照**：`GET /networks/{net}/pools/multi/{addr1,addr2,...}`，每次最多 30 個地址（官方文件值；上限實作時實測，不足時縮小批次）。取 `reserve_in_usd`（TVL）、`volume_usd.h24`、`base_token_price_usd`、`quote_token_price_usd`。
+- **SRC-GT-3** **快照**：`GET /networks/{net}/pools/multi/{addr1,addr2,...}`，每次最多 30 個地址（官方文件值；上限實作時實測，不足時縮小批次）。取 `reserve_in_usd`（TVL）、`volume_usd.h24`、`base_token_price_usd`、`quote_token_price_usd`，以及 `relationships.base_token`、`relationships.quote_token` 的代幣地址，供上層依地址對應到 token0／token1（CALC-APY-3）。
 - **SRC-GT-4** **日線**：`GET /networks/{net}/pools/{address}/ohlcv/day?limit={n}&currency=usd`，每筆含 UTC 日期與美元交易量，最多回傳約 60 天。沒有成交的日子不回傳 K 線，上層視為交易量 0（CALC-AGG-3）。**實作時確認**：日線的日期是否為 UTC 00:00 起算。
-- **SRC-GT-5** 回補：新池子第一次被發現時，抓取日線 `limit=60`。
+- **SRC-GT-5** 回補：新池子第一次被發現時，抓取日線 `limit=60`。之後的例行抓取（`daily_close`）涵蓋 `volume_synced_through − 2` 到昨日，至少 3 天，以吸收資料源的延遲修正與先前的失敗。成功取得、且抓取時間晚於某日結束時，該日以前即視為已同步，更新 `volume_synced_through`（CALC-DAY-4）。
 - **SRC-GT-6** GeckoTerminal 沒有歷史 TVL、沒有 APY、沒有 L；這些由本系統的快照與鏈上讀取補上。
 - **SRC-GT-7** 完整性檢查：TVL、交易量、兩個代幣價格皆存在且可解析為非負數字；否則該池子這次快照不完整（CALC-STATE-3）。
 
@@ -134,8 +134,9 @@
 
 ## 5. 股價（yfinance）
 
-- **SRC-YF-1** 以 yfinance 抓取日 K 線（OHLC，未調整與調整後價格以實作時確認的單一口徑為準，全系統一致）。代號轉換見 CALC-VOL-7。報價資產序列：`BNB-USD`、`ETH-USD`、`SOL-USD`。
+- **SRC-YF-1** 以 yfinance 抓取日 K 線（OHLC）。價格口徑全系統一致：**分割還原、不做股利還原**（`auto_adjust=False`，使用 `Open`／`High`／`Low`／`Close`，不使用 `Adj Close`）。理由：未做分割還原時，拆股會在序列中造成虛假的跳空；股利還原則會在每次除息時微幅改寫全部歷史價格，與增量更新（SRC-YF-2）衝突。代號轉換見 CALC-VOL-7。報價資產序列：`BNB-USD`、`ETH-USD`、`SOL-USD`。
 - **SRC-YF-2** 每天抓一次，只補最近 10 個日曆日（涵蓋長週末與短暫失敗）；新代號第一次出現時補足 `SIGMA_WINDOW_CALENDAR_DAYS`。
+- **SRC-YF-6** **歷史改寫偵測**：資料源在拆股後會回頭改寫歷史價格，只補最近幾天會讓資料庫中新舊 K 線的尺度不同。每次增量抓取時，比對回應與資料庫中重疊日期的收盤價，任一日相對差異超過 `PRICE_RESYNC_TOLERANCE`，或沒有任何重疊日期（例如連續失敗超過 10 天），即重抓該序列的整個 `SIGMA_WINDOW_CALENDAR_DAYS` 窗口並覆寫，同時寫入開發者紀錄。
 - **SRC-YF-3** 鎖定 yfinance 版本。股價抓取只在這一個模組中，介面為「代號 + 日期區間 → 日 K 線列表」，長期失效時可替換為其他來源（例如 Stooq）而不影響其他模組。
 - **SRC-YF-5** 每個新代號第一次出現時，另以 yfinance 取得證券名稱（`longName`，沒有時用 `shortName`）並存起來，供 DATA-REG-9 的名稱比對使用；取得失敗時下次清單更新再試。名稱很少變動，之後每 30 天更新一次。
 - **SRC-YF-4** 完整性檢查：每根 K 線 OHLC 皆為正數、`low ≤ open, close ≤ high`；不符的 K 線丟棄並記錄。代號查無資料時回報 `invalid`（原因 `UNKNOWN_TICKER`），上層標示 `NC_NO_PRICE_SOURCE`。

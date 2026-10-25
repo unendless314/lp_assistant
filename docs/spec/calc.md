@@ -43,6 +43,8 @@
 | `LOSS_RATIO_RED_FROM` | 1.00 | 損耗比紅色下限（含） | PRD F2 |
 | `DELIST_MISSING_DAYS`（PRD 中的 N） | 3 | 連續幾個有效更新日未出現即「官方已下架」 | 初始值；見 [`data-model.md`](data-model.md) DATA-REG-4 |
 | `REPORTED_APY_LOG_RATIO` | 2.0 | 資料源 APY 與本站相差超過此倍數（任一方向）時寫入開發者紀錄 | 初始值 |
+| `VOLUME_SYNC_MAX_LAG_DAYS` | 1 | `volume_synced_through` 落後昨日超過此天數即「數據過期」（CALC-DAY-4） | 正常情況下午夜到 `daily_close` 完成前會落後 1 天 |
+| `PRICE_RESYNC_TOLERANCE` | 0.005 | 股價重疊日差異超過此比例即重抓整個窗口（[`sources.md`](sources.md) SRC-YF-6） | 初始值；拆股造成的差異為整數倍，遠大於此值 |
 
 ---
 
@@ -50,7 +52,8 @@
 
 - **CALC-DAY-1** 一個「日」為 UTC 00:00:00（含）到隔日 00:00:00（不含）。快照依其 UTC 時間戳歸日；外部日線依來源標示的 UTC 日期歸日（各來源的日期語意見 [`sources.md`](sources.md)）。
 - **CALC-DAY-2** 只有**已結束**的 UTC 日會產生日 APY。當日（尚未結束）不參與任何中位數。
-- **CALC-DAY-3** 「最近 7 天」指截至昨日（含）往回 7 個 UTC 日；「最近 30 天」同理。
+- **CALC-DAY-3** 「最近 7 天」指截至該池子的 `volume_synced_through`（CALC-DAY-4，含）往回 7 個 UTC 日；「最近 30 天」同理。
+- **CALC-DAY-4** `volume_synced_through`：池子最後一個「在該日結束後，成功抓取過涵蓋該日的外部日線」的 UTC 日（[`data-model.md`](data-model.md) DATA-POOL-1）。窗口以它而非昨日為終點，因為午夜後到 `daily_close` 完成前，昨日的交易量尚未取得，不得當成 0，也不得讓窗口因缺日而無法計算。`昨日 − volume_synced_through` 超過 `VOLUME_SYNC_MAX_LAG_DAYS` 天時，池子為「數據過期」（`STALE_VOLUME`，§7.1）。
 
 ---
 
@@ -101,9 +104,11 @@
   equiv_usd   = 2 × L × sqrt_p ÷ 10^(token1 精度) × token1 美元價格
   ```
 
-  `token1 美元價格` 取同一筆快照中資料源給的代幣價格。此換算已在 research 2026-10-24 §2 以價格交叉驗證（誤差 < 1%）。
+  `token1 美元價格` 取同一筆快照中資料源給的代幣價格。資料源的價格以 base／quote 標示（[`sources.md`](sources.md) SRC-GT-3），一律**依代幣地址**對應到鏈上的 token0／token1，不得假設 base 即 token0。此換算已在 research 2026-10-24 §2 以價格交叉驗證（誤差 < 1%）。
 - **CALC-APY-8** **分母為零**：單筆快照的 L = 0 是正常狀態（現價不在任何 LP 的區間內），照常計入平均。`denom_usd(d)` 平均後仍為 0 時，`d` 日沒有 `daily_apy`（原因 `NC_ZERO_DENOMINATOR`），不得計算成無限大。分母為負屬於「錯誤」（CALC-STATE 表）。
 - **CALC-APY-4** **沒有完整快照的日子**（系統上線前的回補日，以及上線後斷線的日子）：交易量照常取自外部日線，分母、`fee_rate`、`lp_share` 改用**時間上最接近的完整快照**的值（距離相同時取較早者）；該日標記為「近似」。因此池子從外部日線的第一天起，每一天都有 `daily_apy`。上線前的回補日因此一律使用第一筆完整快照，與 PRD「以現值近似」一致。
+  - 池子**從未有完整快照**時，所有日子都沒有 `daily_apy`；池子依 §7.1 為「數據過期」（或更前面的排除類狀態）。
+  - 已彙整的日子（[`data-model.md`](data-model.md) DATA-STORE-3）直接使用彙整時已決定的分母、`fee_rate`、`lp_share` 與近似標記，不重新選取。最接近的完整快照只存在於已彙整的日子時（斷線超過約 60 天），以時間上最接近的已彙整日的已決定值代替。
 - **CALC-APY-5** `fee_rate` 一律使用鏈上讀取值（F2-AC7）。池名費率只用於比對，不一致時寫入開發者紀錄。費率讀取方式依 DEX 而定，見 [`sources.md`](sources.md) §4。
 - **CALC-APY-6** `lp_share` 的取得方式見 [`sources.md`](sources.md) §4。若同一池子的 token0、token1 方向抽成比例不同，取兩者平均並寫入開發者紀錄。
 - **CALC-APY-7** 「池子平均 APY」（只用於顯示，F6-AC8）：與 CALC-APY-1 相同，但分母一律用當日 TVL 平均（CALC-APY-2 的算法），排名與狀態判定都不使用它。V2 池的池子平均 APY 恆等於全區間 APY。顯示值取其 7 天中位數（CALC-AGG-1 的算法），使兩個數字的時間窗口一致，比值即反映集中程度。
@@ -112,7 +117,7 @@
 
 - **CALC-AGG-1** `apy_7d` = 最近 7 個 UTC 日（CALC-DAY-3）的 `daily_apy` 中位數。窗口內每一天都必須有 `daily_apy`（實測或近似皆可），否則不計算：缺日是因為歷史不足時為「資料不足」，因為分母為零（CALC-APY-8）時為「無法計算」。
 - **CALC-AGG-2** `apy_30d` = 最近 30 個 UTC 日的 `daily_apy` 中位數（偶數個時取中間兩個的平均）。窗口內有任何一天沒有 `daily_apy` 時為缺值，顯示「—」（F2-AC10）。
-- **CALC-AGG-3** `history_days` = 池子從外部日線的第一個日期到昨日的天數（含回補）。日線中間缺少的日期視為交易量 0（外部日線對沒有成交的日子不回傳 K 線，見 SRC-GT-4）。`history_days < MIN_HISTORY_DAYS` 為「資料不足」，此時 `apy_7d` 與其衍生值（淨收益、損耗比、容錯空間、池子平均 APY）都不計算，不以不足 7 天的資料硬算。
+- **CALC-AGG-3** `history_days` = 池子從外部日線的第一個日期到 `volume_synced_through`（CALC-DAY-4）的天數（含回補）。日線中間缺少的日期視為交易量 0（外部日線對沒有成交的日子不回傳 K 線，見 SRC-GT-4）。`history_days < MIN_HISTORY_DAYS` 為「資料不足」，此時 `apy_7d` 與其衍生值（淨收益、損耗比、容錯空間、池子平均 APY）都不計算，不以不足 7 天的資料硬算。
 - **CALC-AGG-4** **近似標記 `≈`**：`apy_7d` 的窗口內有任何一天標記為近似（CALC-APY-4）時，`apy_7d` 帶近似標記；`apy_30d` 同理。由 `apy_7d` 衍生的淨收益、損耗比沿用 `apy_7d` 的標記（F2-AC11）。
 - **CALC-AGG-5** **趨勢箭頭**：`apy_30d` 有值且大於 0 時，令 `r = apy_7d ÷ apy_30d`；`r ≥ TREND_UP_RATIO` 為 ↑，`r ≤ TREND_DOWN_RATIO` 為 ↓，其餘不顯示（F6-AC9）。
 
@@ -167,7 +172,7 @@
 | 暫停交易 | 池子內任一登記表代幣狀態為「暫停交易」 | `TOKEN_HALTED` |
 | 錯誤 | 鏈上讀到的 `fee_rate` 不在 `(0, FEE_RATE_MAX]`；`lp_share` 不在 `(0, 1]`；L 為負或無法解碼；√P ≤ 0 或無法解碼；TVL 或交易量為負 | `ERR_FEE_OUT_OF_RANGE`、`ERR_LP_SHARE_OUT_OF_RANGE`、`ERR_LIQUIDITY_DECODE`、`ERR_NEGATIVE_VALUE` |
 | 無法計算 | DEX 沒有對應的 L 讀取方式；費率無法取得（含動態費率池）；`lp_share` 讀取方式未知或尚待查證；標的沒有 Yahoo 股價；σ 樣本不足、過期、為零或超出公式範圍；7 天窗口內有分母為零的日子 | `NC_NO_LIQUIDITY_READER`、`NC_NO_FEE_RATE`、`NC_NO_LP_SHARE`、`NC_NO_PRICE_SOURCE`、`NC_SIGMA_INSUFFICIENT`、`NC_SIGMA_STALE`、`NC_SIGMA_DEGENERATE`、`NC_SIGMA_OUT_OF_RANGE`、`NC_ZERO_DENOMINATOR` |
-| 數據過期 | `now − last_complete_snapshot_at > FRESHNESS_STALE_HOURS` | `STALE` |
+| 數據過期 | `now − last_complete_snapshot_at > FRESHNESS_STALE_HOURS`；池子從未有完整快照（`last_complete_snapshot_at` 為空）；或交易量同步落後（CALC-DAY-4） | `STALE`、`STALE_NEVER_COMPLETE`、`STALE_VOLUME` |
 | 資料不足 | `history_days < MIN_HISTORY_DAYS` | `INSUFFICIENT_HISTORY` |
 
 - **CALC-STATE-1** 「讀不到」分兩種，處理不同：**結構性讀不到**（DEX 不支援、費率是動態的、編碼未知）為「無法計算」；**暫時讀不到**（網路錯誤、逾時、RPC 限流）不改變狀態，只是那一次快照不完整，由新鮮度反映（CALC-STATE-4）。讀到了但值不合理為「錯誤」（F2-AC24）。

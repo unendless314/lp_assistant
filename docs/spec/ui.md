@@ -132,7 +132,7 @@ TVL $2.06M   24h 交易量 $1.36M
 
 - **UI-FRESH-1** 前端使用的門檻一律讀 `latest.json` 的 `thresholds`，不在前端另設常數，避免與後端設定不同步。
 - **UI-FRESH-2** 頁面開啟期間，每 10 分鐘重新抓取 `latest.json`；抓取失敗時保留目前資料，下次再試。重新抓取後保留展開狀態、搜尋內容與捲動位置。
-- **UI-FRESH-3** 每個池子的新鮮度標示由前端以訪客當下時間重算：`now − last_complete_snapshot_at` 依 `thresholds` 分為正常、數據延遲（「數據 N 小時前」，N 無條件捨去到整數小時）、數據過期（灰掉）。即使 JSON 匯出時該池子還是正常，訪客晚開頁面時仍會看到正確的標示。
+- **UI-FRESH-3** 每個池子的新鮮度標示由前端以訪客當下時間重算：`now − last_complete_snapshot_at` 依 `thresholds` 分為正常、數據延遲（「數據 N 小時前」，N 無條件捨去到整數小時）、數據過期（灰掉）；`last_complete_snapshot_at` 為 `null` 時一律為數據過期（CALC-STATE 表）。即使 JSON 匯出時該池子還是正常，訪客晚開頁面時仍會看到正確的標示。
 - **UI-FRESH-4** **中斷橫幅**：`now − last_successful_run_at > thresholds.pipeline_banner_hours` 時，頁面頂端顯示「資料更新中斷，以下為 {last_successful_run_at} 的數據」，下方內容照常顯示（F6-AC18）。
 - **UI-FRESH-5** **過期後重新排序**：前端依 UI-FRESH-3 算出某池子為數據過期、而 JSON 中它不是時（只發生在後端停擺、JSON 未再更新的期間），前端把「數據過期」**加入**該池子的狀態集合（JSON 的 `status.primary` 與 `status.secondary`），移除「數據延遲」提示，再依 PRD 狀態表由上而下重新選出主要狀態（F2-AC19）：原本為「官方已下架」「暫停交易」「錯誤」「無法計算」的池子主要狀態不變，「數據過期」成為次要狀態；原本沒有排除類狀態或主要狀態為「資料不足」的池子，主要狀態變為「數據過期」。接著依 [`calc.md`](calc.md) CALC-RANK-2、CALC-RANK-4～CALC-RANK-8 重新選取最佳淨收益、卡片分類、情況 B 的主要原因與排行順序。例：後端停擺超過 24 小時後，原本為情況 A 的卡片轉為情況 B，排到可排名卡片之後，與 F6-AC5 一致。
 - **UI-FRESH-6** 前端排序實作與後端共用一組測試案例（[`test.md`](test.md) TEST-DATA-7）：沒有任何池子被前端改為過期時，前端的結果必須與 JSON 完全相同。
