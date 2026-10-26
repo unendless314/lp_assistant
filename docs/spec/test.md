@@ -157,7 +157,7 @@
 | NFR-AC6 | E | 360px 寬度下 `scrollWidth ≤ clientWidth` |
 | NFR-AC7 | F | ESLint 規則禁止範本中出現未經語系函式的文字 |
 | NFR-AC8 | E | 同 F6-AC17，擴及頁面上所有操作；Caddy 設定只允許 `GET`、`HEAD` |
-| NFR-AC9 | P | 固定時鐘推進 2 小時，`collect` 執行 4 次 |
+| NFR-AC9 | P | 固定時鐘推進 2 小時，`collect` 執行 4 次；主機時區分別設為 `UTC`、`Europe/Berlin`（含夏令時間切換日）、`Asia/Taipei` 時，各工作的觸發時間（以 UTC 表示）完全相同（architecture §5.1） |
 | NFR-AC10 | P | 每次工作在 `runs` 留下完整欄位 |
 | NFR-AC11 | P、M | P：備份檔可開啟並通過 `integrity_check`、筆數一致；M：每月實際還原一次 |
 | NFR-AC12 | M | 檢查移植檔案的授權聲明 |
