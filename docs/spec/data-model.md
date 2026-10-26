@@ -179,7 +179,7 @@
   "schema_version": 1,
   "generated_at": "2026-10-26T12:30:00Z",        // 本次匯出時間
   "last_successful_run_at": "2026-10-26T12:30:00Z", // 最後一次成功完成的收集＋匯出（橫幅判斷，F6-AC18）
-  "thresholds": { "freshness_delayed_hours": 2, "freshness_stale_hours": 24, "pipeline_banner_hours": 2 }, // 前端唯一的門檻來源（UI-FRESH）
+  "thresholds": { "apy_spread_ratio_flag": 3, "freshness_delayed_hours": 2, "freshness_stale_hours": 24, "pipeline_banner_hours": 2 }, // 前端唯一的門檻來源（UI-FRESH-1）；apy_spread_ratio_flag 只用於說明文字（UI 4.3），標記本身由後端判定
   "stocks": [ /* 6.2，所有收錄代幣的卡片，含情況 C */ ],
   "pools":  { /* pool_id → 6.3 */ },
   "ranking": [ /* 市場收益排行的 stock_id 順序（CALC-RANK-5） */ ],
