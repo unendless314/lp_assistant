@@ -194,7 +194,7 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 - **部署方式**：`git pull` 後執行部署腳本（後端 `uv sync`、資料庫遷移、前端建置、重啟 systemd 服務）。
 - **備份**：每日備份上傳到 Cloudflare R2 的專用 bucket（憑證只能寫入該 bucket）。每月以腳本還原最新備份並跑 `PRAGMA integrity_check` 與筆數比對（NFR-AC11）。
 - **資料庫遷移**：schema 版本存在資料庫中，程式啟動時依序套用未執行的遷移腳本；遷移前自動備份。
-- **同機 agent（選用）**：若在同一台 VPS 上執行 agent 框架（§10），它以獨立的系統帳號與獨立的 systemd 服務執行，與排程程序互不依賴：agent 停止或出錯不影響排程與網頁，排程也不等待 agent。
+- **同機 agent（選用）**：若在同一台 VPS 上執行 agent 框架（§10），它以獨立的 systemd 服務執行，與排程程序互不依賴：agent 停止或出錯不影響排程與網頁，排程也不等待 agent。信任定位與維運政策見 §8。
 
 ---
 
@@ -202,11 +202,13 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 
 - 伺服器不存放私鑰、助記詞或錢包憑證；沒有任何交易功能（NFR-AC1）。
 - 本系統唯一的憑證：可能使用的付費 RPC 金鑰（放 `.env`），以及 R2 備份憑證（限定單一 bucket、只能寫入）。
-- **同機 agent 的權限邊界**：agent 會讀到外部資料（例如官方清單中的代幣名稱），也會收到通訊軟體上的訊息，兩者都可能夾帶誘導它執行指令的內容，因此以系統帳號權限作為最後防線：
-  - 可讀：`site/data/latest.json`；可執行 CLI 的查詢指令（§6，唯讀）。
-  - 不可寫：`data/`、`config/`、程式碼目錄；不可讀：專案的 `.env`。
-  - agent 自己的 LLM 金鑰與通訊軟體 bot token 放在 agent 帳號下，不放進本專案的 `.env`；它們不是錢包憑證，不違反 NFR-AC1。
-  - 寫入能力（例如修改 `devs_pick.yaml`）不在目前範圍；日後開放時只考慮低風險設定檔，並依賴 DATA-CFG-2 的驗證擋下格式錯誤。
+- **同機 agent 的信任定位**：同機 agent 具一般主機操作能力（通用 shell、SSH、可寫專案路徑），是**受信任的主機操作者，不構成安全隔離**。agent 會讀到外部資料（例如官方清單中的代幣名稱），也會收到通訊軟體上的訊息，兩者都可能夾帶誘導它執行指令的內容（prompt injection）；本架構不宣稱能技術性地阻止被誘導或被入侵的 agent 越界。
+  - **維運政策**：雲端 VPS 只執行、不修改。agent 依政策只透過資料介面（`latest.json`、CLI 查詢指令 `--json`）讀取，不修改本站的程式、資料與設定；程式與設定的變更一律在開發機完成，經 `git pull` 部署（§7）。此政策降低人為與模型誤操作的風險，但不是對 agent 的技術控制。
+  - **唯讀資料介面的作用**：讓正常整合不會因查詢而改寫資料（DATA-CLI-4），並提供比直接讀資料庫更穩定、耦合更少的契約。它是防呆與穩定性設計，不是安全邊界。
+  - **不新增對外入口**：通訊整合不得替本站新增公開的監聽埠或 Caddy 路由；agent 的 gateway 以對外連線（輪詢或長連線）與通訊平台溝通。若日後改用需要入站連線的 webhook，須另做入站驗證與安全審查。
+  - **憑證**：agent 自己的 LLM 金鑰與通訊軟體 bot token 不放進本專案的 `.env`；它們不是錢包憑證，不違反 NFR-AC1。
+  - **復原**：資料被意外改寫時，依賴 VPS 以外的每日備份（DATA-STORE-5）復原。
+  - **日後若要成為真正的邊界**：部署後的程式、設定與虛擬環境改由另一個帳號持有、agent 不可寫，變更只能經由受控的部署帳號或 CI/CD 送入；agent 只拿到固定的查詢與通知工具，沒有通用 shell。目前不在範圍。
 - 網頁沒有寫入端點（NFR-AC8），Caddy 只允許 `GET`、`HEAD`。
 - 依賴套件鎖定版本，CI 跑 `pip-audit` 與 `npm audit`。
 
@@ -234,7 +236,7 @@ domain ◀── engine ◀── jobs ──▶ sources ──▶ domain
 
 | 候選功能 | 承接方式 |
 |---|---|
-| 同機 agent 存取 | 同一台 VPS 上的 agent 框架（例如 Hermes Agent）透過本機介面讀取資料，再經由自己的 gateway 連到通訊軟體與使用者互動。本系統只提供本機資料介面：市場資料讀 `latest.json`，營運資料用 CLI `--json`（§6、[`data-model.md`](spec/data-model.md) §7）。不開網路 API，權限邊界見 §8 |
+| 同機 agent 存取 | 同一台 VPS 上的 agent 框架（例如 Hermes Agent）透過本機介面讀取資料，再經由自己的 gateway 連到通訊軟體與使用者互動。本系統只提供本機資料介面：市場資料讀 `latest.json`，營運資料用 CLI `--json`（§6、[`data-model.md`](spec/data-model.md) §7）。不開網路 API，信任定位見 §8 |
 | 通知提醒 | 由同機 agent 實現：定期讀取 `latest.json`（資料每 30 分鐘更新，讀取頻率不需更高）、比對門檻後以 agent 自己的通訊管道推送。本系統不新增推送工作，也不需要網頁寫入功能；使用者的持倉等個人資料留在 agent 端 |
 | 淨收益歷史走勢、長期穩定度 | `pool_snapshots` 與 `pool_snapshots_daily` 已永久保存；匯出另一個按需載入的歷史檔 |
 | 跨發行商比價 | `engine` 新增計算；`sources` 已有代幣價格 |

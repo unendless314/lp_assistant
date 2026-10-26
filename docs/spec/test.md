@@ -18,7 +18,7 @@
 | **U** | 引擎單元測試 | pytest | `engine/` 的純函式：公式、狀態、排序、登記表狀態機 | 無 |
 | **S** | 來源解析測試 | pytest | `sources/` 解析錄好的真實回應；完整性檢查 | 錄製的回應檔 |
 | **P** | 流程整合測試 | pytest | `jobs/` 用暫存 SQLite、假來源、固定時鐘跑完整流程 | 無 |
-| **X** | 輸出契約測試 | pytest + JSON Schema | `latest.json` 符合 [`data-model.md`](data-model.md) §6；重複產生位元組相同 | 無 |
+| **X** | 輸出契約測試 | pytest + JSON Schema | `latest.json` 符合 [`data-model.md`](data-model.md) §6；CLI `--json` 輸出符合 §7；重複產生位元組相同 | 無 |
 | **F** | 前端單元測試 | Vitest | 格式化、顏色、搜尋比對、排序切換、新鮮度 | 無 |
 | **E** | 端對端測試 | Playwright | 以固定的 `latest.json` 啟動網站，驗證畫面與互動 | 無 |
 | **M** | 人工檢查 | 檢查清單 | 無法自動判定的項目 | — |
@@ -31,7 +31,7 @@
 
 - **TEST-TRACE-1** 每個測試以標記註明它驗證的條文：pytest 用 `@pytest.mark.req("F2-AC4", "CALC-APY-1")`；Vitest 與 Playwright 在測試名稱開頭寫 `[F6-AC11]`。
 - **TEST-TRACE-2** 腳本 `scripts/trace.py` 掃描所有測試的標記，產生「條文 → 測試」對照表，並在 CI 中檢查：
-  - 每一條 `F*-AC*`、`NFR-AC*`、`CALC-*` 至少有一個測試，或列在 §5 的人工檢查清單中。
+  - 每一條 `F*-AC*`、`NFR-AC*`、`CALC-*`、`DATA-CLI-*` 至少有一個測試，或列在 §5 的人工檢查清單中。`DATA-CLI-*` 納入的理由：CLI 是同機 agent 依賴的對外契約，與 `latest.json` 同等重要，卻沒有對應的 PRD 驗收條件。
   - 標記中引用的條文編號都存在於文件中（防止引用已改號或打錯的條文）。
 - **TEST-TRACE-3** 對照表由腳本產生，不手寫在本文件中；本文件 §4 只規定每條驗收條件的**驗證層級**。
 
@@ -161,6 +161,17 @@
 | NFR-AC10 | P | 每次工作在 `runs` 留下完整欄位 |
 | NFR-AC11 | P、M | P：備份檔可開啟並通過 `integrity_check`、筆數一致；M：每月實際還原一次 |
 | NFR-AC12 | M | 檢查移植檔案的授權聲明 |
+
+### CLI 資料介面（工程契約，無對應的 PRD 驗收條件）
+
+| 條文 | 層 | 驗證方式 |
+|---|---|---|
+| DATA-CLI-1 | X | 三個指令加 `--json` 時，stdout 可整份解析為 JSON 且沒有其他內容；資料庫不存在、參數錯誤時結束碼分別為 1、2，stdout 為空，錯誤只在 stderr；查無資料時結束碼 0、`items` 為 `[]` |
+| DATA-CLI-2 | X | 輸出符合 JSON Schema（外層與三種 `items`）；所有欄位都存在，沒有值者為 `null`；同樣的資料庫與參數兩次輸出的 `items` 相同 |
+| DATA-CLI-3 | X | Schema 中的 `schema_version` 與程式常數一致（改動 schema 而未升版時測試失敗的機制，實作時以 schema 快照比對） |
+| DATA-CLI-4 | P | 以暫存 SQLite 建立含各資料表的資料，執行三個指令（含分頁與各種篩選）前後，比對所有資料表內容與資料目錄下的檔案完全相同，特別是 `runs` 與 `dev_log` 沒有新增列 |
+| DATA-CLI-5～7 | X | 各指令的固定排序與次要排序鍵；各篩選參數 |
+| DATA-CLI-8 | X | `--limit` 預設 100、上限 1,000、超過為參數錯誤；逐頁讀完的結果與一次讀完相同；翻頁途中寫入新資料，不重複也不遺漏已存在的資料；游標搭配不同的篩選參數時為參數錯誤 |
 
 ## 5. 人工檢查清單
 

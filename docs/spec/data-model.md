@@ -253,7 +253,79 @@
 
 CLI 查詢指令（[`../architecture.md`](../architecture.md) §6）加上 `--json` 時的輸出。使用者是開發者的腳本與同機 agent（[`../architecture.md`](../architecture.md) §10），因此與 `latest.json` 一樣視為對外介面。
 
-- **DATA-CLI-1** 輸出一個 JSON 物件到 stdout，頂層含 `schema_version`（整數）、`generated_at`（UTC ISO 8601）與資料本體；錯誤訊息只寫到 stderr，並以非零結束碼結束，stdout 不混入非 JSON 內容。
-- **DATA-CLI-2** 欄位命名、狀態代碼與比率單位與 §6 相同（DATA-OUT-1、DATA-OUT-2），同一個概念不在兩種輸出中用不同名稱。
-- **DATA-CLI-3** 新增欄位不升版；刪除、改名或改變欄位意義時，`schema_version` 加一。`latest.json` 的 `schema_version` 採相同規則。
-- **DATA-CLI-4** 查詢指令只讀不寫：以唯讀模式開啟資料庫，不寫入任何資料表或檔案（包括 `runs` 與 `dev_log`）。
+- **DATA-CLI-1** **輸出通道**：輸出一個 JSON 物件到 stdout，結尾一個換行；stdout 不混入任何非 JSON 內容（進度、警告、日誌一律寫到 stderr）。結束碼：成功 `0`；參數錯誤 `2`；執行錯誤（例如資料庫無法開啟）`1`，此時 stdout 為空，錯誤訊息只寫到 stderr。查詢結果為空不是錯誤：結束碼 `0`，`items` 為空陣列。
+- **DATA-CLI-2** **共用外層**（三個指令相同）：
+
+  ```jsonc
+  {
+    "schema_version": 1,
+    "generated_at": "2026-10-26T12:30:00Z",  // 指令執行時間
+    "report": "runs",                         // runs／devlog／registry
+    "items": [ /* DATA-CLI-5～7 */ ],
+    "next_cursor": null                       // 還有下一頁時為不透明字串，否則為 null
+  }
+  ```
+
+  - **欄位一律存在**：沒有值的欄位輸出 `null`，不省略鍵；陣列沒有元素時為 `[]`。
+  - **時間**：UTC ISO 8601，秒精度，以 `Z` 結尾（同 §6）。
+  - **命名與單位**：與 §6 相同（DATA-OUT-1、DATA-OUT-2），同一個概念不在兩種輸出中用不同名稱。
+  - **確定性**：物件鍵依字母排序；`items` 依各指令的固定排序（含次要鍵），同樣的資料庫內容與參數產生相同的 `items`（同 DATA-OUT-5）。
+- **DATA-CLI-3** **版本規則**：新增欄位、新增列舉值（例如新的 `code`）不升版；刪除、改名、改變欄位意義或型別時，`schema_version` 加一。`latest.json` 的 `schema_version` 採相同規則。讀取端應忽略不認識的欄位。
+- **DATA-CLI-4** **只讀不寫**：查詢指令以唯讀模式開啟資料庫，不寫入任何資料表或檔案（包括 `runs` 與 `dev_log`）。
+- **DATA-CLI-8** **分頁**：每頁筆數由 `--limit` 指定，預設 100，上限 1,000，超過上限時為參數錯誤。分頁採鍵集（keyset）方式：`next_cursor` 編碼最後一筆的排序鍵，以 `--cursor` 傳回取得下一頁；因此翻頁期間有新資料寫入時，已讀過的筆數不會重複或遺漏（新寫入的較新資料不會出現在後續頁）。游標只對產生它的指令與篩選參數有效，不符時為參數錯誤。
+
+### 7.1 `lpa report runs`
+
+- **DATA-CLI-5** 每筆為一次排程工作（`runs` 資料表）。排序：`started_at` 由新到舊，平手依 `run_id` 由大到小。篩選：`--job <名稱>`、`--since <UTC 時間>`、`--result <ok|failed|running>`。
+
+  ```jsonc
+  {
+    "run_id": 1024,
+    "job": "collect",                   // architecture §5.2 的工作名稱
+    "started_at": "2026-10-26T12:00:00Z",
+    "finished_at": "2026-10-26T12:02:10Z", // 執行中為 null
+    "result": "ok",                     // ok／failed／running
+    "error": null,                      // 工作失敗時的摘要訊息
+    "counts_as_successful_run": true,   // 是否更新 last_successful_run_at（architecture §5.2）
+    "sources": [                        // 依 source 字母排序
+      { "source": "geckoterminal", "ok": 1480, "invalid": 0, "failed": 20 }
+    ]
+  }
+  ```
+
+### 7.2 `lpa report devlog`
+
+- **DATA-CLI-6** 每筆為一則開發者紀錄（`dev_log` 資料表）。排序：`ts` 由新到舊，平手依 `id` 由大到小。篩選：`--code <代碼>`（可重複）、`--since <UTC 時間>`。
+
+  ```jsonc
+  {
+    "id": 5521,
+    "ts": "2026-10-26T12:01:00Z",
+    "code": "FEE_NAME_MISMATCH",        // 事件代碼，例：UNLISTED_DEX、DEX_NOT_ENABLED、COUNT_DROP、NAME_UNVERIFIED
+    "subject_type": "pool",             // pool／token／stock／dex／source／null
+    "subject_id": "robinhood:0x...",    // 對應的識別碼（DATA-ID）；沒有時為 null
+    "message": "...",                   // 給人看的摘要
+    "details": { }                      // 事件代碼專屬的結構化資料；沒有時為 {}
+  }
+  ```
+
+  `details` 的內容依 `code` 而定，實作時以程式中的事件代碼表為準；同一個 `code` 的 `details` 結構變動同樣適用 DATA-CLI-3。
+
+### 7.3 `lpa report registry`
+
+- **DATA-CLI-7** 每筆為登記表中的一個代幣（`tokens` 資料表，DATA-REG-1），含未收錄者。排序：`token_id` 字典序。篩選：`--issuer`、`--chain`、`--status <active|halted|delisted>`、`--excluded`（只列不收錄者）、`--included`（只列收錄者）。
+
+  ```jsonc
+  {
+    "token_id": "bsc:0x...",
+    "issuer": "bstock", "chain": "bsc", "address": "0x...", "address_role": "primary",
+    "symbol": "TSLAB", "underlying_ticker": "TSLA", "underlying_isin": "US88160R1014",
+    "underlying_name": "Tesla, Inc.", "underlying_exchange_mic": null,
+    "stock_id": "isin:US88160R1014",    // 不收錄者為 null
+    "registry_status": "active",        // active／halted／delisted
+    "excluded_reason": null,            // MANUAL／NON_US／LEVERAGED／NAME_UNVERIFIED，收錄者為 null
+    "missing_streak": 0,
+    "first_seen_at": "2026-10-24T00:10:00Z",
+    "last_seen_at": "2026-10-26T00:10:00Z"
+  }
+  ```
